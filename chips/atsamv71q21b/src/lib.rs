@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
-//! Peripheral implementations for the IMXRT1050 and IMXRT1060 MCUs.
+//! Peripheral implementations for the SAMV71 MCU.
 //!
-//! imxrt1050 chip: <https://www.nxp.com/design/development-boards/i-mx-evaluation-and-development-boards/i-mx-rt1050-evaluation-kit:MIMXRT1050-EVK>
+//! <https://www.microchip.com/en-us/product/ATSAMV71Q21>
 
 #![no_std]
 
@@ -56,7 +56,6 @@ pub static BASE_VECTORS: [unsafe extern "C" fn(); 16] = [
     CortexM7::SYSTICK_HANDLER, // SysTick
 ];
 
-// imxrt 1050 has total of 160 interrupts
 #[cfg_attr(all(target_arch = "arm", target_os = "none"), link_section = ".irqs")]
 // used Ensures that the symbol is kept until the final binary
 #[cfg_attr(all(target_arch = "arm", target_os = "none"), used)]
