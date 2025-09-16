@@ -11,15 +11,15 @@ use kernel::platform::chip::{Chip, InterruptService};
 
 use crate::nvic;
 
-pub struct Imxrt10xx<I: InterruptService + 'static> {
+pub struct Atsamv71q21b<I: InterruptService + 'static> {
     mpu: cortexm7::mpu::MPU,
     userspace_kernel_boundary: cortexm7::syscall::SysCall,
     interrupt_service: &'static I,
 }
 
-impl<I: InterruptService + 'static> Imxrt10xx<I> {
+impl<I: InterruptService + 'static> Atsamv71q21b<I> {
     pub unsafe fn new(interrupt_service: &'static I) -> Self {
-        Imxrt10xx {
+        Atsamv71q21b {
             mpu: cortexm7::mpu::new(),
             userspace_kernel_boundary: cortexm7::syscall::SysCall::new(),
             interrupt_service,
@@ -27,7 +27,8 @@ impl<I: InterruptService + 'static> Imxrt10xx<I> {
     }
 }
 
-pub struct Imxrt10xxDefaultPeripherals {
+pub struct Atsamv71q21bDefaultPeripherals {
+    /* Disabled 2025-09-09 to just get a really basic kernel working
     pub iomuxc: crate::iomuxc::Iomuxc,
     pub iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs,
     pub ccm: &'static crate::ccm::Ccm,
@@ -40,11 +41,12 @@ pub struct Imxrt10xxDefaultPeripherals {
     pub lpuart2: crate::lpuart::Lpuart<'static>,
     pub gpt1: crate::gpt::Gpt1<'static>,
     pub gpt2: crate::gpt::Gpt2<'static>,
+    */
 }
 
-impl Imxrt10xxDefaultPeripherals {
+impl Atsamv71q21bDefaultPeripherals {
     pub fn new(ccm: &'static crate::ccm::Ccm) -> Self {
-        Self {
+        Self {/*n
             iomuxc: crate::iomuxc::Iomuxc::new(),
             iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs::new(),
             ccm,
@@ -56,14 +58,14 @@ impl Imxrt10xxDefaultPeripherals {
             lpuart1: crate::lpuart::Lpuart::new_lpuart1(ccm),
             lpuart2: crate::lpuart::Lpuart::new_lpuart2(ccm),
             gpt1: crate::gpt::Gpt1::new_gpt1(ccm),
-            gpt2: crate::gpt::Gpt2::new_gpt2(ccm),
+            gpt2: crate::gpt::Gpt2::new_gpt2(ccm),*/
         }
     }
 }
 
-impl InterruptService for Imxrt10xxDefaultPeripherals {
+impl InterruptService for Atsamv71q21bDefaultPeripherals {
     unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
-        match interrupt {
+        /*match interrupt {
             nvic::LPUART1 => self.lpuart1.handle_interrupt(),
             nvic::LPUART2 => self.lpuart2.handle_interrupt(),
             nvic::LPI2C1 => self.lpi2c1.handle_event(),
@@ -97,12 +99,12 @@ impl InterruptService for Imxrt10xxDefaultPeripherals {
             _ => {
                 return false;
             }
-        }
+        }*/
         true
     }
 }
 
-impl<I: InterruptService + 'static> Chip for Imxrt10xx<I> {
+impl<I: InterruptService + 'static> Chip for Atsamv71q21b<I> {
     type MPU = cortexm7::mpu::MPU;
     type UserspaceKernelBoundary = cortexm7::syscall::SysCall;
 
