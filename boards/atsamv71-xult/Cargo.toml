@@ -3,7 +3,7 @@
 # Copyright Tock Contributors 2022.
 
 [package]
-name = "imxrt1050-evkb"
+name = "atsamv71-xult"
 version.workspace = true
 authors.workspace = true
 build = "../build.rs"

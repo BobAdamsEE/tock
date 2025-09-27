@@ -6,9 +6,9 @@
 
 use core::fmt::Write;
 use cortexm7::{CortexM7, CortexMVariant};
-use kernel::debug;
 use kernel::platform::chip::{Chip, InterruptService};
 
+use crate::gpio;
 use crate::nvic;
 
 pub struct Atsamv71q21b<I: InterruptService + 'static> {
@@ -28,37 +28,14 @@ impl<I: InterruptService + 'static> Atsamv71q21b<I> {
 }
 
 pub struct Atsamv71q21bDefaultPeripherals {
-    /* Disabled 2025-09-09 to just get a really basic kernel working
-    pub iomuxc: crate::iomuxc::Iomuxc,
-    pub iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs,
-    pub ccm: &'static crate::ccm::Ccm,
-    pub dcdc: crate::dcdc::Dcdc<'static>,
-    pub dma: crate::dma::Dma<'static>,
-    pub ccm_analog: crate::ccm_analog::CcmAnalog,
-    pub ports: crate::gpio::Ports<'static>,
-    pub lpi2c1: crate::lpi2c::Lpi2c<'static>,
-    pub lpuart1: crate::lpuart::Lpuart<'static>,
-    pub lpuart2: crate::lpuart::Lpuart<'static>,
-    pub gpt1: crate::gpt::Gpt1<'static>,
-    pub gpt2: crate::gpt::Gpt2<'static>,
-    */
+    pub pa: crate::gpio::Port<'static>,
 }
 
 impl Atsamv71q21bDefaultPeripherals {
-    pub fn new(ccm: &'static crate::ccm::Ccm) -> Self {
-        Self {/*n
-            iomuxc: crate::iomuxc::Iomuxc::new(),
-            iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs::new(),
-            ccm,
-            dcdc: crate::dcdc::Dcdc::new(ccm),
-            dma: crate::dma::Dma::new(ccm),
-            ccm_analog: crate::ccm_analog::CcmAnalog::new(),
-            ports: crate::gpio::Ports::new(ccm),
-            lpi2c1: crate::lpi2c::Lpi2c::new_lpi2c1(ccm),
-            lpuart1: crate::lpuart::Lpuart::new_lpuart1(ccm),
-            lpuart2: crate::lpuart::Lpuart::new_lpuart2(ccm),
-            gpt1: crate::gpt::Gpt1::new_gpt1(ccm),
-            gpt2: crate::gpt::Gpt2::new_gpt2(ccm),*/
+    //The new function is where the power manager could be referenced
+    pub fn new() -> Self {
+        Self {
+            pa: crate::gpio::Port::new_port_a(),
         }
     }
 }
