@@ -9,6 +9,7 @@
 #![no_std]
 
 pub mod chip;
+pub mod gpio;
 pub mod nvic;
 
 // Peripherals

@@ -15,79 +15,134 @@ use kernel::utilities::registers::{
 };
 use kernel::utilities::StaticRef;
 
-pub const PIOA_BASE: StaticRef<PioaRegisters> =
-    unsafe { StaticRef::new(0x400E_0E00 as *const PioaRegisters) };
+const PIOA_BASE: StaticRef<PioaRegisters> =
+    unsafe { StaticRef::new(0x400E0E00 as *const PioaRegisters) };
 
 register_structs! {
-    PioaRegisters {
+    pub PioaRegisters {
+        /// PIO Enable Register
         (0x000 => per: WriteOnly<u32, PER::Register>),
+        /// PIO Disable Register
         (0x004 => pdr: WriteOnly<u32, PDR::Register>),
+        /// PIO Status Register
         (0x008 => psr: ReadOnly<u32, PSR::Register>),
         (0x00C => _reserved0),
+        /// Output Enable Register
         (0x010 => oer: WriteOnly<u32, OER::Register>),
+        /// Output Disable Register
         (0x014 => odr: WriteOnly<u32, ODR::Register>),
+        /// Output Status Register
         (0x018 => osr: ReadOnly<u32, OSR::Register>),
         (0x01C => _reserved1),
+        /// Glitch Input Filter Enable Register
         (0x020 => ifer: WriteOnly<u32, IFER::Register>),
+        /// Glitch Input Filter Disable Register
         (0x024 => ifdr: WriteOnly<u32, IFDR::Register>),
+        /// Glitch Input Filter Status Register
         (0x028 => ifsr: ReadOnly<u32, IFSR::Register>),
         (0x02C => _reserved2),
+        /// Set Output Data Register
         (0x030 => sodr: WriteOnly<u32, SODR::Register>),
+        /// Clear Output Data Register
         (0x034 => codr: WriteOnly<u32, CODR::Register>),
+        /// Output Data Status Register
         (0x038 => odsr: ReadWrite<u32, ODSR::Register>),
+        /// Pin Data Status Register
         (0x03C => pdsr: ReadOnly<u32, PDSR::Register>),
+        /// Interrupt Enable Register
         (0x040 => ier: WriteOnly<u32, IER::Register>),
+        /// Interrupt Disable Register
         (0x044 => idr: WriteOnly<u32, IDR::Register>),
+        /// Interrupt Mask Register
         (0x048 => imr: ReadOnly<u32, IMR::Register>),
+        /// Interrupt Status Register
         (0x04C => isr: ReadOnly<u32, ISR::Register>),
+        /// Multi-driver Enable Register
         (0x050 => mder: WriteOnly<u32, MDER::Register>),
+        /// Multi-driver Disable Register
         (0x054 => mddr: WriteOnly<u32, MDDR::Register>),
+        /// Multi-driver Status Register
         (0x058 => mdsr: ReadOnly<u32, MDSR::Register>),
         (0x05C => _reserved3),
+        /// Pull-up Disable Register
         (0x060 => pudr: WriteOnly<u32, PUDR::Register>),
+        /// Pull-up Enable Register
         (0x064 => puer: WriteOnly<u32, PUER::Register>),
+        /// Pad Pull-up Status Register
         (0x068 => pusr: ReadOnly<u32, PUSR::Register>),
         (0x06C => _reserved4),
-        (0x070 => abcdsr_0: ReadWrite<u32, ABCDSR0::Register>),
-        (0x074 => abcdsr_1: ReadWrite<u32, ABCDSR1::Register>),
+        /// Peripheral ABCD Select Register 0
+        (0x070 => abcdsr_0: ReadWrite<u32, ABCDSR[0]::Register>),
+        /// Peripheral ABCD Select Register 0
+        (0x074 => abcdsr_1: ReadWrite<u32, ABCDSR[1]::Register>),
         (0x078 => _reserved5),
+        /// Input Filter Slow Clock Disable Register
         (0x080 => ifscdr: WriteOnly<u32, IFSCDR::Register>),
+        /// Input Filter Slow Clock Enable Register
         (0x084 => ifscer: WriteOnly<u32, IFSCER::Register>),
+        /// Input Filter Slow Clock Status Register
         (0x088 => ifscsr: ReadOnly<u32, IFSCSR::Register>),
+        /// Slow Clock Divider Debouncing Register
         (0x08C => scdr: ReadWrite<u32>),
+        /// Pad Pull-down Disable Register
         (0x090 => ppddr: WriteOnly<u32, PPDDR::Register>),
+        /// Pad Pull-down Enable Register
         (0x094 => ppder: WriteOnly<u32, PPDER::Register>),
+        /// Pad Pull-down Status Register
         (0x098 => ppdsr: ReadOnly<u32, PPDSR::Register>),
         (0x09C => _reserved6),
+        /// Output Write Enable
         (0x0A0 => ower: WriteOnly<u32, OWER::Register>),
+        /// Output Write Disable
         (0x0A4 => owdr: WriteOnly<u32, OWDR::Register>),
+        /// Output Write Status Register
         (0x0A8 => owsr: ReadOnly<u32, OWSR::Register>),
         (0x0AC => _reserved7),
+        /// Additional Interrupt Modes Enable Register
         (0x0B0 => aimer: WriteOnly<u32, AIMER::Register>),
+        /// Additional Interrupt Modes Disable Register
         (0x0B4 => aimdr: WriteOnly<u32, AIMDR::Register>),
+        /// Additional Interrupt Modes Mask Register
         (0x0B8 => aimmr: ReadOnly<u32, AIMMR::Register>),
         (0x0BC => _reserved8),
+        /// Edge Select Register
         (0x0C0 => esr: WriteOnly<u32, ESR::Register>),
+        /// Level Select Register
         (0x0C4 => lsr: WriteOnly<u32, LSR::Register>),
+        /// Edge/Level Status Register
         (0x0C8 => elsr: ReadOnly<u32, ELSR::Register>),
         (0x0CC => _reserved9),
+        /// Falling Edge/Low-Level Select Register
         (0x0D0 => fellsr: WriteOnly<u32, FELLSR::Register>),
+        /// Rising Edge/High-Level Select Register
         (0x0D4 => rehlsr: WriteOnly<u32, REHLSR::Register>),
+        /// Fall/Rise - Low/High Status Register
         (0x0D8 => frlhsr: ReadOnly<u32, FRLHSR::Register>),
         (0x0DC => _reserved10),
+        /// Lock Status
         (0x0E0 => locksr: ReadOnly<u32, LOCKSR::Register>),
+        /// Write Protection Mode Register
         (0x0E4 => wpmr: ReadWrite<u32, WPMR::Register>),
+        /// Write Protection Status Register
         (0x0E8 => wpsr: ReadOnly<u32, WPSR::Register>),
         (0x0EC => _reserved11),
+        /// Schmitt Trigger Register
         (0x100 => schmitt: ReadWrite<u32, SCHMITT::Register>),
         (0x104 => _reserved12),
+        /// I/O Drive Register
         (0x118 => driver: ReadWrite<u32, DRIVER::Register>),
         (0x11C => _reserved13),
+        /// Parallel Capture Mode Register
         (0x150 => pcmr: ReadWrite<u32, PCMR::Register>),
+        /// Parallel Capture Interrupt Enable Register
         (0x154 => pcier: WriteOnly<u32, PCIER::Register>),
+        /// Parallel Capture Interrupt Disable Register
         (0x158 => pcidr: WriteOnly<u32, PCIDR::Register>),
+        /// Parallel Capture Interrupt Mask Register
         (0x15C => pcimr: ReadOnly<u32, PCIMR::Register>),
+        /// Parallel Capture Interrupt Status Register
         (0x160 => pcisr: ReadOnly<u32, PCISR::Register>),
+        /// Parallel Capture Reception Holding Register
         (0x164 => pcrhr: ReadOnly<u32>),
         (0x168 => @END),
     }
@@ -3235,7 +3290,7 @@ PCRHR [
     /// Parallel Capture Mode Reception Data
     RDATA OFFSET(0) NUMBITS(32) []
 ],
-ABCDSR0 [
+ABCDSR[0] [
     /// Peripheral Select
     P0 OFFSET(0) NUMBITS(1) [],
     /// Peripheral Select
@@ -3301,7 +3356,7 @@ ABCDSR0 [
     /// Peripheral Select
     P31 OFFSET(31) NUMBITS(1) []
 ],
-ABCDSR1 [
+ABCDSR[1] [
     /// Peripheral Select
     P0 OFFSET(0) NUMBITS(1) [],
     /// Peripheral Select
@@ -3410,7 +3465,7 @@ pub enum Pin {
     PA08, PA09, PA10, PA11, PA12, PA13, PA14, PA15,
     PA16, PA17, PA18, PA19, PA20, PA21, PA22, PA23,
     PA24, PA25, PA26, PA27, PA28, PA29, PA30, PA31,
-/* 
+
     PB00, PB01, PB02, PB03, PB04, PB05, PB06, PB07,
     PB08, PB09, PB12, PB13, 
 
@@ -3424,7 +3479,7 @@ pub enum Pin {
     PD16, PD17, PD18, PD19, PD20, PD21, PD22, PD23,
     PD24, PD25, PD26, PD27, PD28, PD29, PD30, PD31,
 
-    PE00, PE01, PE02, PE03, PE04, PE05,*/
+    PE00, PE01, PE02, PE03, PE04, PE05,
 }
 
 /// GPIO port that manages a variable number of pins to support the B
@@ -3445,7 +3500,8 @@ pub enum Pin {
 /// first port has pins called "PA00" thru "PA31".
 ///
 pub struct Port<'a, const N: usize> {
-    registers: StaticRef<PioaRegisters>,
+    registers: StaticRef<GpioRegisters>,
+    clock: PortClock<'a>,
     pins: [Pin<'a>; N],
 }
 
@@ -3503,87 +3559,87 @@ impl Port<'_> {
             ],
         }
     }
-    /*
-        pub const fn new_port_b() -> Self {
-            Self {
-                port: unsafe { StaticRef::new((BASE_ADDRESS + 1 * SIZE) as *const GpioRegisters) },
-                pins: [
-                    GPIOPin::new(Pin::PB00),
-                    GPIOPin::new(Pin::PB01),
-                    GPIOPin::new(Pin::PB02),
-                    GPIOPin::new(Pin::PB03),
-                    GPIOPin::new(Pin::PB04),
-                    GPIOPin::new(Pin::PB05),
-                    GPIOPin::new(Pin::PB06),
-                    GPIOPin::new(Pin::PB07),
-                    GPIOPin::new(Pin::PB08),
-                    GPIOPin::new(Pin::PB09),
-                    GPIOPin::new(Pin::PB10),
-                    GPIOPin::new(Pin::PB11),
-                    GPIOPin::new(Pin::PB12),
-                    GPIOPin::new(Pin::PB13),
-                    GPIOPin::new(Pin::PB14),
-                    GPIOPin::new(Pin::PB15),
-                    GPIOPin::new(Pin::PB16),
-                    GPIOPin::new(Pin::PB17),
-                    GPIOPin::new(Pin::PB18),
-                    GPIOPin::new(Pin::PB19),
-                    GPIOPin::new(Pin::PB20),
-                    GPIOPin::new(Pin::PB21),
-                    GPIOPin::new(Pin::PB22),
-                    GPIOPin::new(Pin::PB23),
-                    GPIOPin::new(Pin::PB24),
-                    GPIOPin::new(Pin::PB25),
-                    GPIOPin::new(Pin::PB26),
-                    GPIOPin::new(Pin::PB27),
-                    GPIOPin::new(Pin::PB28),
-                    GPIOPin::new(Pin::PB29),
-                    GPIOPin::new(Pin::PB30),
-                    GPIOPin::new(Pin::PB31),
-                ],
-            }
-        }
 
-        pub const fn new_port_c() -> Self {
-            Self {
-                port: unsafe { StaticRef::new((BASE_ADDRESS + 2 * SIZE) as *const GpioRegisters) },
-                pins: [
-                    GPIOPin::new(Pin::PC00),
-                    GPIOPin::new(Pin::PC01),
-                    GPIOPin::new(Pin::PC02),
-                    GPIOPin::new(Pin::PC03),
-                    GPIOPin::new(Pin::PC04),
-                    GPIOPin::new(Pin::PC05),
-                    GPIOPin::new(Pin::PC06),
-                    GPIOPin::new(Pin::PC07),
-                    GPIOPin::new(Pin::PC08),
-                    GPIOPin::new(Pin::PC09),
-                    GPIOPin::new(Pin::PC10),
-                    GPIOPin::new(Pin::PC11),
-                    GPIOPin::new(Pin::PC12),
-                    GPIOPin::new(Pin::PC13),
-                    GPIOPin::new(Pin::PC14),
-                    GPIOPin::new(Pin::PC15),
-                    GPIOPin::new(Pin::PC16),
-                    GPIOPin::new(Pin::PC17),
-                    GPIOPin::new(Pin::PC18),
-                    GPIOPin::new(Pin::PC19),
-                    GPIOPin::new(Pin::PC20),
-                    GPIOPin::new(Pin::PC21),
-                    GPIOPin::new(Pin::PC22),
-                    GPIOPin::new(Pin::PC23),
-                    GPIOPin::new(Pin::PC24),
-                    GPIOPin::new(Pin::PC25),
-                    GPIOPin::new(Pin::PC26),
-                    GPIOPin::new(Pin::PC27),
-                    GPIOPin::new(Pin::PC28),
-                    GPIOPin::new(Pin::PC29),
-                    GPIOPin::new(Pin::PC30),
-                    GPIOPin::new(Pin::PC31),
-                ],
-            }
+    pub const fn new_port_b() -> Self {
+        Self {
+            port: unsafe { StaticRef::new((BASE_ADDRESS + 1 * SIZE) as *const GpioRegisters) },
+            pins: [
+                GPIOPin::new(Pin::PB00),
+                GPIOPin::new(Pin::PB01),
+                GPIOPin::new(Pin::PB02),
+                GPIOPin::new(Pin::PB03),
+                GPIOPin::new(Pin::PB04),
+                GPIOPin::new(Pin::PB05),
+                GPIOPin::new(Pin::PB06),
+                GPIOPin::new(Pin::PB07),
+                GPIOPin::new(Pin::PB08),
+                GPIOPin::new(Pin::PB09),
+                GPIOPin::new(Pin::PB10),
+                GPIOPin::new(Pin::PB11),
+                GPIOPin::new(Pin::PB12),
+                GPIOPin::new(Pin::PB13),
+                GPIOPin::new(Pin::PB14),
+                GPIOPin::new(Pin::PB15),
+                GPIOPin::new(Pin::PB16),
+                GPIOPin::new(Pin::PB17),
+                GPIOPin::new(Pin::PB18),
+                GPIOPin::new(Pin::PB19),
+                GPIOPin::new(Pin::PB20),
+                GPIOPin::new(Pin::PB21),
+                GPIOPin::new(Pin::PB22),
+                GPIOPin::new(Pin::PB23),
+                GPIOPin::new(Pin::PB24),
+                GPIOPin::new(Pin::PB25),
+                GPIOPin::new(Pin::PB26),
+                GPIOPin::new(Pin::PB27),
+                GPIOPin::new(Pin::PB28),
+                GPIOPin::new(Pin::PB29),
+                GPIOPin::new(Pin::PB30),
+                GPIOPin::new(Pin::PB31),
+            ],
         }
-    */
+    }
+
+    pub const fn new_port_c() -> Self {
+        Self {
+            port: unsafe { StaticRef::new((BASE_ADDRESS + 2 * SIZE) as *const GpioRegisters) },
+            pins: [
+                GPIOPin::new(Pin::PC00),
+                GPIOPin::new(Pin::PC01),
+                GPIOPin::new(Pin::PC02),
+                GPIOPin::new(Pin::PC03),
+                GPIOPin::new(Pin::PC04),
+                GPIOPin::new(Pin::PC05),
+                GPIOPin::new(Pin::PC06),
+                GPIOPin::new(Pin::PC07),
+                GPIOPin::new(Pin::PC08),
+                GPIOPin::new(Pin::PC09),
+                GPIOPin::new(Pin::PC10),
+                GPIOPin::new(Pin::PC11),
+                GPIOPin::new(Pin::PC12),
+                GPIOPin::new(Pin::PC13),
+                GPIOPin::new(Pin::PC14),
+                GPIOPin::new(Pin::PC15),
+                GPIOPin::new(Pin::PC16),
+                GPIOPin::new(Pin::PC17),
+                GPIOPin::new(Pin::PC18),
+                GPIOPin::new(Pin::PC19),
+                GPIOPin::new(Pin::PC20),
+                GPIOPin::new(Pin::PC21),
+                GPIOPin::new(Pin::PC22),
+                GPIOPin::new(Pin::PC23),
+                GPIOPin::new(Pin::PC24),
+                GPIOPin::new(Pin::PC25),
+                GPIOPin::new(Pin::PC26),
+                GPIOPin::new(Pin::PC27),
+                GPIOPin::new(Pin::PC28),
+                GPIOPin::new(Pin::PC29),
+                GPIOPin::new(Pin::PC30),
+                GPIOPin::new(Pin::PC31),
+            ],
+        }
+    }
+
     pub fn handle_interrupt(&self) {
         let port: &GpioRegisters = &self.port;
 
