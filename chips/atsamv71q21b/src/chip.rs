@@ -28,7 +28,7 @@ impl<I: InterruptService + 'static> Atsamv71q21b<I> {
 }
 
 pub struct Atsamv71q21bDefaultPeripherals {
-    pub pa: crate::gpio::Port<'static>,
+    pub pa: crate::gpio::Port<'static, 32>,
 }
 
 impl Atsamv71q21bDefaultPeripherals {
