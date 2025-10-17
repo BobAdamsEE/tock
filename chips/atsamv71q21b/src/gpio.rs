@@ -4,7 +4,6 @@
 
 //! Implementation of the GPIO controller for the SAMV71.
 
-use core::ops::{Index, IndexMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel::hil;
 use kernel::hil::gpio;
@@ -3456,7 +3455,7 @@ pub type PortD = Port<32>;
 pub type PortE = Port<6>;
 
 impl PortA {
-    pub const fn new() -> Self {
+    pub const fn new_port_a() -> Self {
         Self {
             registers: unsafe { StaticRef::new(BASE_ADDRESS as *const GpioRegisters) },
             pins: [
@@ -3498,7 +3497,7 @@ impl PortA {
 }
 
 impl PortB {
-    pub const fn new() -> Self {
+    pub const fn new_port_b() -> Self {
         Self {
             registers: unsafe { StaticRef::new((BASE_ADDRESS + 1 * SIZE) as *const GpioRegisters) },
             pins: [
@@ -3520,7 +3519,7 @@ impl PortB {
 }
 
 impl PortC {
-    pub const fn new() -> Self {
+    pub const fn new_port_c() -> Self {
         Self {
             registers: unsafe { StaticRef::new((BASE_ADDRESS + 2 * SIZE) as *const GpioRegisters) },
             pins: [
@@ -3562,7 +3561,7 @@ impl PortC {
 }
 
 impl PortD {
-    pub const fn new() -> Self {
+    pub const fn new_port_d() -> Self {
         Self {
             registers: unsafe { StaticRef::new((BASE_ADDRESS + 3 * SIZE) as *const GpioRegisters) },
             pins: [
@@ -3604,7 +3603,7 @@ impl PortD {
 }
 
 impl PortE {
-    pub const fn new() -> Self {
+    pub const fn new_port_e() -> Self {
         Self {
             registers: unsafe { StaticRef::new((BASE_ADDRESS + 4 * SIZE) as *const GpioRegisters) },
             pins: [
@@ -3623,15 +3622,17 @@ impl<const N: usize> Port<N> {
     pub fn handle_interrupt(&self) {
         let port: &GpioRegisters = &self.registers;
 
-        // Interrupt Flag Register (IFR) bits are only valid if the same bits
-        // are enabled in Interrupt Enabled Register (IER).
-        let mut fired = port.ifr.val.get() & port.ier.val.get();
+        // Interrupt Status Register (ISR - 32.6.17) bits are only valid if the same bits
+        // are enabled in Interrupt Mask Register (IMR - 32.6.16).
+        let mut fired = port.isr.get() & port.imr.get();
         loop {
             let pin = fired.trailing_zeros() as usize;
             if pin < self.pins.len() {
                 fired &= !(1 << pin);
                 self.pins[pin].handle_interrupt();
-                port.ifr.clear.set(1 << pin);
+                // I don't know why the line was here - ISR is cleared
+                // on read, and would therefore be cleared by setting fired
+                //port.isr.clear.set(1 << pin);
             } else {
                 break;
             }
@@ -3664,115 +3665,117 @@ impl<'a> GPIOPin<'a> {
 
     pub fn select_peripheral(&self, function: PeripheralFunction) {
         let f = function as u32;
-        let (bit0, bit1, bit2) = (f & 0b1, (f & 0b10) >> 1, (f & 0b100) >> 2);
+        let (bit0, bit1) = (f & 0b1, (f & 0b10) >> 1);
         let port: &GpioRegisters = &self.port;
 
         // clear GPIO enable for pin
-        port.gper.clear.set(self.pin_mask);
+        port.per.set(self.pin_mask);
 
-        // Set PMR0-2 according to passed in peripheral
+        // Set ABCDSR0-1 according to passed in peripheral
         if bit0 == 0 {
-            port.pmr0.clear.set(self.pin_mask);
+            port.abcdsr_0.set(0 << self.pin_mask);
         } else {
-            port.pmr0.set.set(self.pin_mask);
+            port.abcdsr_0.set(1 << self.pin_mask);
         }
         if bit1 == 0 {
-            port.pmr1.clear.set(self.pin_mask);
+            port.abcdsr_1.set(0 << self.pin_mask);
         } else {
-            port.pmr1.set.set(self.pin_mask);
-        }
-        if bit2 == 0 {
-            port.pmr2.clear.set(self.pin_mask);
-        } else {
-            port.pmr2.set.set(self.pin_mask);
+            port.abcdsr_1.set(1 << self.pin_mask);
         }
     }
 
     pub fn enable(&self) {
         let port: &GpioRegisters = &self.port;
-        port.gper.set.set(self.pin_mask);
+        port.per.set(1 << self.pin_mask);
     }
 
     pub fn disable(&self) {
         let port: &GpioRegisters = &self.port;
-        port.gper.clear.set(self.pin_mask);
+        port.pdr.set(1 << self.pin_mask);
     }
 
     pub fn is_pending(&self) -> bool {
         let port: &GpioRegisters = &self.port;
-        (port.ifr.val.get() & self.pin_mask) != 0
+        (port.isr.get() & self.pin_mask) != 0
     }
 
     pub fn enable_output(&self) {
         let port: &GpioRegisters = &self.port;
-        port.oder.set.set(self.pin_mask);
+        port.oer.set(1 << self.pin_mask);
     }
 
     pub fn disable_output(&self) {
         let port: &GpioRegisters = &self.port;
-        port.oder.clear.set(self.pin_mask);
+        port.odr.set(1 << self.pin_mask);
     }
 
     pub fn enable_pull_down(&self) {
         let port: &GpioRegisters = &self.port;
-        port.pder.set.set(self.pin_mask);
+        port.ppder.set(1 << self.pin_mask);
     }
 
     pub fn disable_pull_down(&self) {
         let port: &GpioRegisters = &self.port;
-        port.pder.clear.set(self.pin_mask);
+        port.ppddr.set(1 << self.pin_mask);
     }
 
     pub fn enable_pull_up(&self) {
         let port: &GpioRegisters = &self.port;
-        port.puer.set.set(self.pin_mask);
+        port.puer.set(1 << self.pin_mask);
     }
 
     pub fn disable_pull_up(&self) {
         let port: &GpioRegisters = &self.port;
-        port.puer.clear.set(self.pin_mask);
+        port.pudr.set(1 << self.pin_mask);
     }
 
-    /// Sets the interrupt mode registers. Interrupts may fire on the rising or
-    /// falling edge of the pin or on both.
+    /// Sets the interrupt mode registers. Interrupts may fire on the rising edge,
+    /// falling edge, or pin level.
     ///
-    /// The mode is a two-bit value based on the mapping from section 23.7.13 of
-    /// the SAM4L datasheet (page 563):
+    /// The mode is readable on the ELSR register from section 32.6.41 of
+    /// the SAMV71 datasheet (page 383):
     ///
-    /// | `mode` value | Interrupt Mode |
-    /// | ------------ | -------------- |
-    /// | 0b00         | Pin change     |
-    /// | 0b01         | Rising edge    |
-    /// | 0b10         | Falling edge   |
+    /// | `ELSR` value | Interrupt Mode  |
+    /// | -----------  | --------------- |
+    /// | 0b0          | Edge detection  |
+    /// | 0b1          | Level detection |
+    ///
+    /// For which level / edge triggers the interrupt, refer to the FRLHSR
+    /// register from section 32.6.44 of the SAMV71 datasheet (page 386)
+    ///
+    /// | `FRLHSR` value | Interrupt Signal          |
+    /// | -------------  | ------------------------- |
+    /// | 0b0            | Falling edge or low-level |
+    /// | 0b1            | Rising edge or high-level |
     ///
     pub fn set_interrupt_mode(&self, mode: u8) {
         let port: &GpioRegisters = &self.port;
         if mode & 0b01 != 0 {
-            port.imr0.set.set(self.pin_mask);
+            port.esr.set(1 << self.pin_mask);
         } else {
-            port.imr0.clear.set(self.pin_mask);
+            port.lsr.set(1 << self.pin_mask);
         }
 
         if mode & 0b10 != 0 {
-            port.imr1.set.set(self.pin_mask);
+            port.fellsr.set(1 << self.pin_mask);
         } else {
-            port.imr1.clear.set(self.pin_mask);
+            port.rehlsr.set(1 << self.pin_mask);
         }
     }
 
     pub fn enable_interrupt(&self) {
         let port: &GpioRegisters = &self.port;
-        if port.ier.val.get() & self.pin_mask == 0 {
+        if port.isr.get() & self.pin_mask == 0 {
             INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
-            port.ier.set.set(self.pin_mask);
+            port.ier.set(self.pin_mask);
         }
     }
 
     pub fn disable_interrupt(&self) {
         let port: &GpioRegisters = &self.port;
-        if port.ier.val.get() & self.pin_mask != 0 {
+        if port.isr.get() & self.pin_mask != 0 {
             INTERRUPT_COUNT.fetch_sub(1, Ordering::Relaxed);
-            port.ier.clear.set(self.pin_mask);
+            port.idr.set(self.pin_mask);
         }
     }
 
@@ -3784,17 +3787,17 @@ impl<'a> GPIOPin<'a> {
 
     pub fn disable_schmidtt_trigger(&self) {
         let port: &GpioRegisters = &self.port;
-        port.ster.clear.set(self.pin_mask);
+        port.schmitt.set(1 << self.pin_mask);
     }
 
     pub fn enable_schmidtt_trigger(&self) {
         let port: &GpioRegisters = &self.port;
-        port.ster.set.set(self.pin_mask);
+        port.schmitt.set(0 << self.pin_mask);
     }
 
     pub fn read(&self) -> bool {
         let port: &GpioRegisters = &self.port;
-        (port.pvr.get() & self.pin_mask) > 0
+        (port.pdsr.get() & self.pin_mask) > 0
     }
 
     pub fn toggle(&self) -> bool {
@@ -3805,12 +3808,12 @@ impl<'a> GPIOPin<'a> {
 
     pub fn set(&self) {
         let port: &GpioRegisters = &self.port;
-        port.ovr.set.set(self.pin_mask);
+        port.sodr.set(self.pin_mask);
     }
 
     pub fn clear(&self) {
         let port: &GpioRegisters = &self.port;
-        port.ovr.clear.set(self.pin_mask);
+        port.codr.set(self.pin_mask);
     }
 }
 
@@ -3863,7 +3866,7 @@ impl gpio::Configure for GPIOPin<'_> {
 
     fn disable_output(&self) -> gpio::Configuration {
         let port: &GpioRegisters = &self.port;
-        port.oder.clear.set(self.pin_mask);
+        port.odr.set(self.pin_mask);
         self.configuration()
     }
 
@@ -3873,18 +3876,18 @@ impl gpio::Configure for GPIOPin<'_> {
 
     fn is_input(&self) -> bool {
         let port: &GpioRegisters = &self.port;
-        port.gper.val.get() & self.pin_mask != 0
+        port.osr.get() & self.pin_mask != 1
     }
 
     fn is_output(&self) -> bool {
         let port: &GpioRegisters = &self.port;
-        port.oder.val.get() & self.pin_mask != 0
+        port.osr.get() & self.pin_mask == 1
     }
 
     fn floating_state(&self) -> gpio::FloatingState {
         let port: &GpioRegisters = &self.port;
-        let down = (port.pder.val.get() & self.pin_mask) != 0;
-        let up = (port.puer.val.get() & self.pin_mask) != 0;
+        let down = (port.ppdsr.get() & self.pin_mask) != 1;
+        let up = (port.pusr.get() & self.pin_mask) != 1;
         if down {
             gpio::FloatingState::PullDown
         } else if up {
@@ -3898,7 +3901,7 @@ impl gpio::Configure for GPIOPin<'_> {
         let port: &GpioRegisters = &self.port;
         let input = self.is_input();
         let output = self.is_output();
-        let gpio = (port.gper.val.get() & self.pin_mask) == 1;
+        let gpio = (port.psr.get() & self.pin_mask) == 1;
         let config = (gpio, input, output);
         match config {
             (false, _, _) => gpio::Configuration::Function,
