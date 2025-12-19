@@ -3443,20 +3443,20 @@ pub enum Pin {
 /// port and offset bit in each register that controls is. For example, the
 /// first port has pins called "PA00" thru "PA31".
 ///
-pub struct Port<const N: usize> {
+pub struct Port<'a, const N: usize> {
     registers: StaticRef<GpioRegisters>,
-    pins: [Pin; N],
+    pins: [GPIOPin<'a>; N],
 }
 
-pub type PortA = Port<32>;
-pub type PortB = Port<12>;
-pub type PortC = Port<32>;
-pub type PortD = Port<32>;
-pub type PortE = Port<6>;
+pub struct PortA<'a>(Port<'a, 32>);
+pub struct PortB<'a>(Port<'a, 12>);
+pub struct PortC<'a>(Port<'a, 32>);
+pub struct PortD<'a>(Port<'a, 32>);
+pub struct PortE<'a>(Port<'a, 6>);
 
-impl PortA {
+impl<'a> PortA<'a> {
     pub const fn new_port_a() -> Self {
-        Self {
+        Self(Port {
             registers: unsafe { StaticRef::new(BASE_ADDRESS as *const GpioRegisters) },
             pins: [
                 Pin::PA00,
@@ -3492,7 +3492,7 @@ impl PortA {
                 Pin::PA30,
                 Pin::PA31,
             ],
-        }
+        })
     }
 }
 
