@@ -5,7 +5,8 @@
 //! Peripheral implementations for the SAMV71 MCU.
 //!
 //! <https://www.microchip.com/en-us/product/ATSAMV71Q21>
-
+//!
+#![recursion_limit = "512"]
 #![no_std]
 
 pub mod chip;
