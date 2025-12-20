@@ -28,14 +28,22 @@ impl<I: InterruptService + 'static> Atsamv71q21b<I> {
 }
 
 pub struct Atsamv71q21bDefaultPeripherals {
-    pub pa: crate::gpio::Port<'static, 32>,
+    pub pa: crate::gpio::PortA<'static>,
+    pub pb: crate::gpio::PortB<'static>,
+    pub pc: crate::gpio::PortC<'static>,
+    pub pd: crate::gpio::PortD<'static>,
+    pub pe: crate::gpio::PortE<'static>,
 }
 
 impl Atsamv71q21bDefaultPeripherals {
     //The new function is where the power manager could be referenced
     pub fn new() -> Self {
         Self {
-            pa: crate::gpio::Port::new_port_a(),
+            pa: crate::gpio::PortA::new_port_a(),
+            pb: crate::gpio::PortB::new_port_b(),
+            pc: crate::gpio::PortC::new_port_c(),
+            pd: crate::gpio::PortD::new_port_d(),
+            pe: crate::gpio::PortE::new_port_e(),
         }
     }
 }
