@@ -3494,6 +3494,9 @@ impl<'a> PortA<'a> {
             ],
         })
     }
+    pub fn pin(&self, pin: usize) -> &GPIOPin<'a> {
+        &self.0.pins[pin]
+    }
 }
 
 impl<'a> PortB<'a> {

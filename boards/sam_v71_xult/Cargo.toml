@@ -1,0 +1,14 @@
+[package]
+name = "sam_v71_xult"
+version = "0.1.0"
+authors = ["Your Name <you@example.com>"]
+edition = "2021"
+
+[dependencies]
+kernel = { path = "../../kernel" }  # Remove features = ["alloc"]
+capsules-core = { path = "../../capsules/core" }
+capsules-extra = { path = "../../capsules/extra" }
+atsamv71q21b = { path = "../../chips/atsamv71q21b" }
+
+# Remove [profile.release] and [profile.dev] sections entirely
+# (They are ignored here; Tock sets optimizations globally if needed)
