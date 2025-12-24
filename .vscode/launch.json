@@ -28,6 +28,30 @@
             "configFiles": [
                 "${workspaceRoot}/boards/msp_exp432p401r/openocd.cfg",
             ]
+        },
+        {
+            "name": "ATSAMV71 Release Debug with J-Link",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "executable": "./target/thumbv7em-none-eabihf/release/sam_v71_xult",
+            "servertype": "jlink",
+            "device": "ATSAMV71Q21B",
+            "interface": "swd",
+            "runToEntryPoint": "main",
+            "svdFile": "./tools/svd2regs/ATSAMV71Q21B.svd",
+            "graphConfig": {
+                "memory": true,
+                "disassembly": true
+            },
+            "symbolOptions": {
+                "useSymbolServer": false,
+                "reloadOnStop": false
+            },
+            "showDevDebugOutput": "both",  // Keep this for now to see detailed logs
+            "logging": {
+                "engineLogging": true
+            }
         }
     ]
 }
