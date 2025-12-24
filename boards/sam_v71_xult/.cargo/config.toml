@@ -2,4 +2,5 @@
 target = "thumbv7em-none-eabihf"
 rustflags = [
   "--cfg", "board=\"sam_v71_xult\"",
+  "-C", "link-arg=-Tlayout.ld",
 ]

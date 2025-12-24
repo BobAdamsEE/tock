@@ -10,7 +10,7 @@ use kernel::hil::gpio::{Configure, Output};
 
 #[no_mangle]
 pub unsafe fn reset_handler() {
-    // Create PortA instance
+    // Create PortA instance./target/thumbv7em-none-eabihf/release/sam_v71_xult
     let porta = PortA::new_port_a();
 
     // Get PA23
