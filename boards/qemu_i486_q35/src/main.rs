@@ -11,6 +11,7 @@
 
 use capsules_core::alarm;
 use capsules_core::console::{self, Console};
+use capsules_core::rng::RngDriver;
 use capsules_core::virtualizers::virtual_alarm::{MuxAlarm, VirtualMuxAlarm};
 use components::console::ConsoleComponent;
 use components::debug_writer::DebugWriterComponent;
@@ -18,19 +19,23 @@ use core::ptr;
 use kernel::capabilities;
 use kernel::component::Component;
 use kernel::debug;
+use kernel::debug::PanicResources;
+use kernel::deferred_call::DeferredCallClient;
 use kernel::hil;
 use kernel::ipc::IPC;
-use kernel::platform::chip::Chip;
-use kernel::platform::scheduler_timer::VirtualSchedulerTimer;
+use kernel::platform::chip::InterruptService;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
-use kernel::process::ProcessArray;
-use kernel::scheduler::cooperative::CooperativeSched;
 use kernel::syscall::SyscallDriver;
+use kernel::utilities::cells::OptionalCell;
+use kernel::utilities::single_thread_value::SingleThreadValue;
 use kernel::{create_capability, static_init};
+use virtio::devices::virtio_rng::VirtIORng;
+use virtio::devices::VirtIODeviceType;
+use virtio_pci_x86::VirtIOPCIDevice;
 use x86::registers::bits32::paging::{PDEntry, PTEntry, PD, PT};
 use x86::registers::irq;
 use x86_q35::pit::{Pit, RELOAD_1KHZ};
-use x86_q35::{Pc, PcComponent};
+use x86_q35::{Pc, PcDefaultPeripherals};
 
 mod multiboot;
 use multiboot::MultibootV1Header;
@@ -38,40 +43,100 @@ use multiboot::MultibootV1Header;
 mod io;
 
 /// Multiboot V1 header, allowing this kernel to be booted directly by QEMU
-#[link_section = ".multiboot"]
+///
+/// When compiling for a macOS host, the `link_section` attribute is elided as
+/// it yields the following error: `mach-o section specifier requires a segment
+/// and section separated by a comma`.
+#[cfg_attr(not(target_os = "macos"), link_section = ".multiboot")]
 #[used]
 static MULTIBOOT_V1_HEADER: MultibootV1Header = MultibootV1Header::new(0);
 
 const NUM_PROCS: usize = 4;
 
-/// Static variables used by io.rs.
-static mut PROCESSES: Option<&'static ProcessArray<NUM_PROCS>> = None;
+type ChipHw = Pc<'static, PcDefaultPeripherals, VirtioDevices>;
+type AlarmHw = Pit<'static, RELOAD_1KHZ>;
+type SchedulerTimerHw =
+    components::virtual_scheduler_timer::VirtualSchedulerTimerComponentType<AlarmHw>;
+type ProcessPrinterInUse = capsules_system::process_printer::ProcessPrinterText;
 
-// Reference to the chip for panic dumps
-static mut CHIP: Option<&'static Pc> = None;
-
-// Reference to the process printer for panic dumps.
-static mut PROCESS_PRINTER: Option<&'static capsules_system::process_printer::ProcessPrinterText> =
-    None;
+/// Resources for when a board panics used by io.rs.
+static PANIC_RESOURCES: SingleThreadValue<PanicResources<ChipHw, ProcessPrinterInUse>> =
+    SingleThreadValue::new(PanicResources::new());
 
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
     capsules_system::process_policies::PanicFaultPolicy {};
 
-/// Dummy buffer that causes the linker to reserve enough space for the stack.
-#[no_mangle]
-#[link_section = ".stack_buffer"]
-static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
+kernel::stack_size! {0x1000}
+
+type SchedulerInUse = components::sched::cooperative::CooperativeComponentType;
 
 // Static allocations used for page tables
 //
 // These are placed into custom sections so they can be properly aligned and padded in layout.ld
 #[no_mangle]
-#[link_section = ".pde"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".pde")]
 pub static mut PAGE_DIR: PD = [PDEntry(0); 1024];
 #[no_mangle]
-#[link_section = ".pte"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".pte")]
 pub static mut PAGE_TABLE: PT = [PTEntry(0); 1024];
+
+/// Initializes a Virtio transport driver for the given PCI device.
+///
+/// Disables MSI/MSI-X interrupts for the device since the x86_q35 chip uses the 8259 PIC for
+/// interrupt management.
+///
+/// On success, returns a tuple containing the interrupt line number assigned to this device as well
+/// as a fully initialized Virtio PCI transport driver.
+///
+/// Returns `None` if the device does not report an assigned interrupt line, or if the transport
+/// driver fails to initialize for some other reason. Either of these could be an indication that
+/// `dev` is not a valid Virtio device.
+fn init_virtio_dev(
+    dev: pci_x86::Device,
+    dev_type: VirtIODeviceType,
+) -> Option<(u8, VirtIOPCIDevice)> {
+    use pci_x86::cap::Cap;
+
+    let int_line = dev.int_line()?;
+
+    for cap in dev.capabilities() {
+        match cap {
+            Cap::Msi(cap) => {
+                cap.disable();
+            }
+            Cap::Msix(cap) => {
+                cap.disable();
+            }
+            _ => {}
+        }
+    }
+
+    let dev = VirtIOPCIDevice::from_pci_device(dev, dev_type)?;
+
+    Some((int_line, dev))
+}
+
+/// Provides interrupt servicing logic for Virtio devices which may or may not be present at
+/// runtime.
+struct VirtioDevices {
+    rng: OptionalCell<(u8, &'static VirtIOPCIDevice)>,
+}
+
+impl InterruptService for VirtioDevices {
+    unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
+        let mut handled = false;
+
+        self.rng.map(|(int_line, dev)| {
+            if interrupt == (int_line as u32) {
+                dev.handle_interrupt();
+                handled = true;
+            }
+        });
+
+        handled
+    }
+}
 
 pub struct QemuI386Q35Platform {
     pconsole: &'static capsules_core::process_console::ProcessConsole<
@@ -90,9 +155,9 @@ pub struct QemuI386Q35Platform {
         VirtualMuxAlarm<'static, Pit<'static, RELOAD_1KHZ>>,
     >,
     ipc: IPC<{ NUM_PROCS as u8 }>,
-    scheduler: &'static CooperativeSched<'static>,
-    scheduler_timer:
-        &'static VirtualSchedulerTimer<VirtualMuxAlarm<'static, Pit<'static, RELOAD_1KHZ>>>,
+    scheduler: &'static SchedulerInUse,
+    scheduler_timer: &'static SchedulerTimerHw,
+    rng: Option<&'static RngDriver<'static, VirtIORng<'static, 'static>>>,
 }
 
 impl SyscallDriverLookup for QemuI386Q35Platform {
@@ -104,13 +169,20 @@ impl SyscallDriverLookup for QemuI386Q35Platform {
             console::DRIVER_NUM => f(Some(self.console)),
             alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules_core::low_level_debug::DRIVER_NUM => f(Some(self.lldb)),
+            capsules_core::rng::DRIVER_NUM => {
+                if let Some(rng) = self.rng {
+                    f(Some(rng))
+                } else {
+                    f(None)
+                }
+            }
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
     }
 }
 
-impl<C: Chip> KernelResources<C> for QemuI386Q35Platform {
+impl<C: kernel::platform::chip::Chip> KernelResources<C> for QemuI386Q35Platform {
     type SyscallDriverLookup = Self;
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         self
@@ -126,13 +198,12 @@ impl<C: Chip> KernelResources<C> for QemuI386Q35Platform {
         &()
     }
 
-    type Scheduler = CooperativeSched<'static>;
+    type Scheduler = SchedulerInUse;
     fn scheduler(&self) -> &Self::Scheduler {
         self.scheduler
     }
 
-    type SchedulerTimer =
-        VirtualSchedulerTimer<VirtualMuxAlarm<'static, Pit<'static, RELOAD_1KHZ>>>;
+    type SchedulerTimer = SchedulerTimerHw;
     fn scheduler_timer(&self) -> &Self::SchedulerTimer {
         self.scheduler_timer
     }
@@ -147,16 +218,57 @@ impl<C: Chip> KernelResources<C> for QemuI386Q35Platform {
         &()
     }
 }
+// `allow(unsupported_calling_conventions)`: cdecl is not valid when testing
+// this code on an x86_64 machine. This avoids a warning until a more permanent
+// fix is decided. See: https://github.com/tock/tock/pull/4662
+#[allow(unsupported_calling_conventions)]
 #[no_mangle]
 unsafe extern "cdecl" fn main() {
     // ---------- BASIC INITIALIZATION -----------
 
+    // Initialize deferred calls very early.
+    kernel::deferred_call::initialize_deferred_call_state::<
+        <ChipHw as kernel::platform::chip::Chip>::ThreadIdProvider,
+    >();
+
     // Basic setup of the i486 platform
-    let chip = PcComponent::new(
-        &mut *ptr::addr_of_mut!(PAGE_DIR),
-        &mut *ptr::addr_of_mut!(PAGE_TABLE),
-    )
-    .finalize(x86_q35::x86_q35_component_static!());
+    // Allocate statics for default peripherals and build them via the chip helper
+    let default_peripherals = unsafe {
+        static_init!(
+            PcDefaultPeripherals,
+            PcDefaultPeripherals::new(
+                (
+                    (kernel::static_buf!(x86_q35::serial::SerialPort<'static>),),
+                    (kernel::static_buf!(x86_q35::serial::SerialPort<'static>),),
+                    (kernel::static_buf!(x86_q35::serial::SerialPort<'static>),),
+                    (kernel::static_buf!(x86_q35::serial::SerialPort<'static>),),
+                    kernel::static_buf!(x86_q35::vga_uart_driver::VgaText<'static>),
+                ),
+                &mut *ptr::addr_of_mut!(PAGE_DIR),
+            )
+        )
+    };
+    default_peripherals.setup_circular_deps();
+    let virtio_devs = static_init!(
+        VirtioDevices,
+        VirtioDevices {
+            rng: OptionalCell::empty(),
+        }
+    );
+    let chip: &'static Pc<PcDefaultPeripherals, VirtioDevices> = unsafe {
+        static_init!(
+            Pc<PcDefaultPeripherals, VirtioDevices>,
+            Pc::new(
+                &*default_peripherals,
+                &mut *ptr::addr_of_mut!(PAGE_DIR),
+                &mut *ptr::addr_of_mut!(PAGE_TABLE),
+                virtio_devs,
+            ),
+        )
+    };
+    PANIC_RESOURCES.get().map(|resources| {
+        resources.chip.put(chip);
+    });
 
     // Acquire required capabilities
     let process_mgmt_cap = create_capability!(capabilities::ProcessManagementCapability);
@@ -166,7 +278,9 @@ unsafe extern "cdecl" fn main() {
     // Create an array to hold process references.
     let processes = components::process_array::ProcessArrayComponent::new()
         .finalize(components::process_array_component_static!(NUM_PROCS));
-    PROCESSES = Some(processes);
+    PANIC_RESOURCES.get().map(|resources| {
+        resources.processes.put(processes.as_slice());
+    });
 
     // Setup space to store the core kernel data structure.
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(processes.as_slice()));
@@ -195,16 +309,9 @@ unsafe extern "cdecl" fn main() {
     // alarm.
     let mux_alarm = static_init!(
         MuxAlarm<'static, Pit<'static, RELOAD_1KHZ>>,
-        MuxAlarm::new(&chip.pit),
+        MuxAlarm::new(chip.pit),
     );
-    hil::time::Alarm::set_alarm_client(&chip.pit, mux_alarm);
-
-    // Virtual alarm for the scheduler
-    let systick_virtual_alarm = static_init!(
-        VirtualMuxAlarm<'static, Pit<'static, RELOAD_1KHZ>>,
-        VirtualMuxAlarm::new(mux_alarm)
-    );
-    systick_virtual_alarm.setup();
+    hil::time::Alarm::set_alarm_client(chip.pit, mux_alarm);
 
     // Virtual alarm and driver for userspace
     let virtual_alarm_user = static_init!(
@@ -225,6 +332,91 @@ unsafe extern "cdecl" fn main() {
     );
     hil::time::Alarm::set_alarm_client(virtual_alarm_user, alarm);
 
+    // ---------- VIRTIO PERIPHERAL DISCOVERY ----------
+    //
+    // On x86, PCI is used to discover and communicate with Virtio devices.
+    //
+    // Enumerate the PCI bus to find supported Virtio devices. If there are two instances of a
+    // supported peripheral, we use the first one we encounter.
+    let mut virtio_rng_dev = None;
+    for dev in pci_x86::iter() {
+        use virtio::devices::VirtIODeviceType;
+        use virtio_pci_x86::{DEVICE_ID_BASE, VENDOR_ID};
+
+        // Only consider Virtio devices
+        if dev.vendor_id() != VENDOR_ID {
+            continue;
+        }
+        let dev_id = dev.device_id();
+        if dev_id < DEVICE_ID_BASE {
+            continue;
+        }
+
+        // Decode device type
+        let dev_id = (dev_id - DEVICE_ID_BASE) as u32;
+        let Some(dev_type) = VirtIODeviceType::from_device_id(dev_id) else {
+            continue;
+        };
+
+        if dev_type == VirtIODeviceType::EntropySource {
+            // Only consider first entropy source found
+            if virtio_rng_dev.is_some() {
+                continue;
+            }
+
+            virtio_rng_dev = Some(dev);
+        }
+    }
+
+    // If there is a VirtIO EntropySource present, use the appropriate VirtIORng
+    // driver and expose it to userspace though the RngDriver
+    let virtio_rng: Option<&'static VirtIORng> = if let Some(rng_dev) = virtio_rng_dev {
+        use virtio::queues::split_queue::{
+            SplitVirtqueue, VirtqueueAvailableRing, VirtqueueDescriptors, VirtqueueUsedRing,
+        };
+        use virtio::queues::Virtqueue;
+        use virtio::transports::VirtIOTransport;
+
+        // Initialize PCI transport driver
+        let (int_line, transport) = init_virtio_dev(rng_dev, VirtIODeviceType::EntropySource)
+            .expect("virtio pci init failed");
+        let transport = static_init!(VirtIOPCIDevice, transport);
+
+        // EntropySource requires a single Virtqueue for retrieved entropy
+        let descriptors = static_init!(VirtqueueDescriptors<1>, VirtqueueDescriptors::default(),);
+        let available_ring =
+            static_init!(VirtqueueAvailableRing<1>, VirtqueueAvailableRing::default(),);
+        let used_ring = static_init!(VirtqueueUsedRing<1>, VirtqueueUsedRing::default(),);
+        let queue = static_init!(
+            SplitVirtqueue<1>,
+            SplitVirtqueue::new(descriptors, available_ring, used_ring),
+        );
+        queue.set_transport(transport);
+
+        // VirtIO EntropySource device driver instantiation
+        let rng = static_init!(VirtIORng, VirtIORng::new(queue));
+        DeferredCallClient::register(rng);
+        queue.set_client(rng);
+
+        // Register the queues and driver with the transport, so interrupts
+        // are routed properly
+        let queues = static_init!([&'static dyn Virtqueue; 1], [queue; 1]);
+        transport.initialize(rng, queues).unwrap();
+
+        // Provide an internal randomness buffer
+        let rng_buffer = static_init!([u8; 64], [0; 64]);
+        rng.provide_buffer(rng_buffer)
+            .expect("rng: providing initial buffer failed");
+
+        // Device is successfully initialized, register it with the VirtioDevices struct so that
+        // interrupts are routed properly
+        virtio_devs.rng.set((int_line, transport));
+
+        Some(rng)
+    } else {
+        None
+    };
+
     // ---------- INITIALIZE CHIP, ENABLE INTERRUPTS ---------
 
     // PIT interrupts need to be started manually
@@ -238,7 +430,9 @@ unsafe extern "cdecl" fn main() {
     // Create the process printer used in panic prints, etc.
     let process_printer = components::process_printer::ProcessPrinterTextComponent::new()
         .finalize(components::process_printer_text_component_static!());
-    PROCESS_PRINTER = Some(process_printer);
+    PANIC_RESOURCES.get().map(|resources| {
+        resources.printer.put(process_printer);
+    });
 
     // ProcessConsole stays on COM1 because we have no keyboard input yet.
     // As soon as keyboard support will be added, the process console
@@ -268,7 +462,7 @@ unsafe extern "cdecl" fn main() {
         .finalize(components::console_component_static!());
 
     // Create the debugger object that handles calls to `debug!()`.
-    DebugWriterComponent::new(
+    DebugWriterComponent::new::<<ChipHw as kernel::platform::chip::Chip>::ThreadIdProvider>(
         debug_uart_device,
         create_capability!(capabilities::SetDebugWriterCapability),
     )
@@ -281,13 +475,22 @@ unsafe extern "cdecl" fn main() {
     )
     .finalize(components::low_level_debug_component_static!());
 
+    // ---------- RNG ----------
+
+    // Userspace RNG driver over the VirtIO EntropySource
+    let rng_driver = virtio_rng.map(|rng| {
+        components::rng::RngRandomComponent::new(board_kernel, capsules_core::rng::DRIVER_NUM, rng)
+            .finalize(components::rng_random_component_static!(VirtIORng))
+    });
+
     let scheduler = components::sched::cooperative::CooperativeComponent::new(processes)
         .finalize(components::cooperative_component_static!(NUM_PROCS));
 
-    let scheduler_timer = static_init!(
-        VirtualSchedulerTimer<VirtualMuxAlarm<'static, Pit<'static, RELOAD_1KHZ>>>,
-        VirtualSchedulerTimer::new(systick_virtual_alarm)
-    );
+    let scheduler_timer =
+        components::virtual_scheduler_timer::VirtualSchedulerTimerComponent::new(mux_alarm)
+            .finalize(components::virtual_scheduler_timer_component_static!(
+                AlarmHw
+            ));
 
     let platform = QemuI386Q35Platform {
         pconsole,
@@ -296,6 +499,7 @@ unsafe extern "cdecl" fn main() {
         lldb,
         scheduler,
         scheduler_timer,
+        rng: rng_driver,
         ipc: kernel::ipc::IPC::new(
             board_kernel,
             kernel::ipc::DRIVER_NUM,

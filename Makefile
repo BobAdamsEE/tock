@@ -476,7 +476,6 @@ ci-job-libraries:
 	@cd libraries/enum_primitive && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 	@cd libraries/riscv-csr && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 	@cd libraries/tock-cells && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
-	@cd libraries/tock-register-interface && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 	@cd libraries/tickv && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 
 .PHONY: ci-job-archs
@@ -485,22 +484,22 @@ ci-job-archs:
 	@for arch in `./tools/build/list_archs.sh`;\
 		do echo "$$(tput bold)Test $$arch";\
 		cd arch/$$arch;\
-		NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test || exit 1;\
+		NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test || exit 1;\
 		cd ../..;\
 		done
 
 .PHONY: ci-job-kernel
 ci-job-kernel:
 	$(call banner,CI-Job: Kernel)
-	@cd kernel && NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test
+	@cd kernel && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 
 .PHONY: ci-job-capsules
 ci-job-capsules:
 	$(call banner,CI-Job: Capsules)
 	@# Capsule initialization depends on board/chip specific imports, so ignore doc tests
-	@cd capsules/core && NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test
-	@cd capsules/extra && NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test
-	@cd capsules/system && NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test
+	@cd capsules/core && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
+	@cd capsules/extra && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
+	@cd capsules/system && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 
 .PHONY: ci-job-chips
 ci-job-chips:
@@ -508,7 +507,7 @@ ci-job-chips:
 	@for chip in `./tools/build/list_chips.sh`;\
 		do echo "$$(tput bold)Test $$chip";\
 		cd chips/$$chip;\
-		NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test || exit 1;\
+		NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test || exit 1;\
 		cd ../..;\
 		done
 
@@ -555,8 +554,6 @@ ci-job-miri:
 	#
 	# Note: This is highly experimental and limited at the moment.
 	#
-	@# Hangs forever during `Building` for this one :shrug:
-	@#cd libraries/tock-register-interface && NOWARNINGS=true cargo miri test
 	@cd kernel && NOWARNINGS=true cargo miri test
 	@for a in $$(tools/build/list_archs.sh); do cd arch/$$a && NOWARNINGS=true cargo miri test && cd ../..; done
 	@cd capsules/core && NOWARNINGS=true cargo miri test

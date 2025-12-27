@@ -10,6 +10,7 @@ use kernel::platform::chip::InterruptService;
 
 use crate::adc;
 use crate::clocks::Clocks;
+use crate::dma;
 use crate::gpio::{RPGpio, RPPins, SIO};
 use crate::i2c;
 use crate::interrupts;
@@ -57,6 +58,7 @@ impl<'a, I: InterruptService> Rp2040<'a, I> {
 impl<I: InterruptService> Chip for Rp2040<'_, I> {
     type MPU = cortexm0p::mpu::MPU;
     type UserspaceKernelBoundary = cortexm0p::syscall::SysCall;
+    type ThreadIdProvider = cortexm0p::thread_id::CortexMThreadIdProvider;
 
     fn service_pending_interrupts(&self) {
         unsafe {
@@ -110,13 +112,14 @@ impl<I: InterruptService> Chip for Rp2040<'_, I> {
         cortexm0p::support::with_interrupts_disabled(f)
     }
 
-    unsafe fn print_state(&self, writer: &mut dyn Write) {
+    unsafe fn print_state(_this: Option<&Self>, writer: &mut dyn Write) {
         CortexM0P::print_cortexm_state(writer);
     }
 }
 
 pub struct Rp2040DefaultPeripherals<'a> {
     pub adc: adc::Adc<'a>,
+    pub dma: dma::Dma<'a>,
     pub clocks: Clocks,
     pub i2c0: i2c::I2c<'a, 'a>,
     pub pins: RPPins<'a>,
@@ -140,6 +143,7 @@ impl Rp2040DefaultPeripherals<'_> {
     pub fn new() -> Self {
         Self {
             adc: adc::Adc::new(),
+            dma: dma::Dma::new(),
             clocks: Clocks::new(),
             i2c0: i2c::I2c::new_i2c0(),
             pins: RPPins::new(),
@@ -223,6 +227,14 @@ impl InterruptService for Rp2040DefaultPeripherals<'_> {
                 // simply ignored.
                 //
                 // Note that PWM interrupts are raised only during unit tests.
+                true
+            }
+            interrupts::DMA_IRQ_0 => {
+                self.dma.handle_interrupt0();
+                true
+            }
+            interrupts::DMA_IRQ_1 => {
+                self.dma.handle_interrupt1();
                 true
             }
             _ => false,

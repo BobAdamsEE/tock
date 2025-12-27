@@ -71,7 +71,7 @@ $(call check_defined, PLATFORM)
 $(call check_defined, TARGET)
 
 # Location of target-specific build.
-# Make sure we delete the ".json" extension if we are building a custon TARGET
+# Make sure we delete the ".json" extension if we are building a custom TARGET
 # defined in a JSON file as cargo defines the target folder without ".json".
 TARGET_PATH := $(TARGET_DIRECTORY)$(subst .json,,$(TARGET))
 
@@ -93,11 +93,6 @@ else
   VERBOSE_FLAGS =
   DEVNULL = > /dev/null
 endif
-
-# Ask git what version of the Tock kernel we are compiling, so we can include
-# this within the binary. If Tock is not within a git repo then we fallback to
-# a set string which should be updated with every release.
-export TOCK_KERNEL_VERSION := $(shell git describe --tags --always 2> /dev/null || echo "2.2+")
 
 # Allow users to opt out of using rustup.
 ifeq ($(NO_RUSTUP),)
@@ -136,7 +131,7 @@ ifneq ($(shell $(RUSTUP) target list | grep "$(TARGET) (installed)"),$(TARGET) (
   $(info If you are just doing some local testing, you can install the)
   $(info target manually for just your system with:)
   $(info )
-  $(info     $(RUSTUP) target add $(TARGET))
+  $(info     $(RUSTUP) target add $(TARGET))
   $(info )
   $(error Missing required target: $(TARGET))
 endif

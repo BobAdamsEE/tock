@@ -111,6 +111,7 @@ impl<'a, I: InterruptService + 'a> Esp32C3<'a, I> {
 impl<'a, I: InterruptService + 'a> Chip for Esp32C3<'a, I> {
     type MPU = PMPUserMPU<8, SimplePMP<16>>;
     type UserspaceKernelBoundary = SysCall;
+    type ThreadIdProvider = rv32i::thread_id::RiscvThreadIdProvider;
 
     fn service_pending_interrupts(&self) {
         loop {
@@ -153,7 +154,7 @@ impl<'a, I: InterruptService + 'a> Chip for Esp32C3<'a, I> {
         rv32i::support::with_interrupts_disabled(f)
     }
 
-    unsafe fn print_state(&self, writer: &mut dyn Write) {
+    unsafe fn print_state(_this: Option<&Self>, writer: &mut dyn Write) {
         let mcval: csr::mcause::Trap = core::convert::From::from(csr::CSR.mcause.extract());
         let _ = writer.write_fmt(format_args!("\r\n---| RISC-V Machine State |---\r\n"));
         let _ = writer.write_fmt(format_args!("Last cause (mcause): "));
@@ -342,3 +343,11 @@ pub extern "C" fn _start_trap_vectored() -> ! {
         start_trap = sym rv32i::_start_trap,
     );
 }
+
+/// Array used to track the "trap handler active" state per hart.
+///
+/// The `riscv` crate requires chip crates to allocate an array to
+/// track whether any given hart is currently in a trap handler. The
+/// array must be zero-initialized.
+#[export_name = "_trap_handler_active"]
+static mut TRAP_HANDLER_ACTIVE: [usize; 1] = [0; 1];

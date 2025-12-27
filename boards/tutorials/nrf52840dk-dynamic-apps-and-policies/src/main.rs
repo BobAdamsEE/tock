@@ -28,8 +28,7 @@ const SCREEN_I2C_SCL_PIN: Pin = Pin::P1_11;
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 8;
 
-type Chip = nrf52840dk_lib::Chip;
-static mut CHIP: Option<&'static Chip> = None;
+type ChipHw = nrf52840dk_lib::ChipHw;
 
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: capsules_system::process_policies::StopWithDebugFaultPolicy =
@@ -135,7 +134,7 @@ impl SyscallDriverLookup for Platform {
         F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
-            capsules_extra::screen::DRIVER_NUM => f(Some(self.screen)),
+            capsules_extra::screen::screen::DRIVER_NUM => f(Some(self.screen)),
             capsules_extra::process_info_driver::DRIVER_NUM => f(Some(self.process_info)),
             capsules_extra::isolated_nonvolatile_storage_driver::DRIVER_NUM => {
                 f(Some(self.nonvolatile_storage))
@@ -147,15 +146,15 @@ impl SyscallDriverLookup for Platform {
 }
 
 // Configure the kernel.
-impl KernelResources<Chip> for Platform {
+impl KernelResources<ChipHw> for Platform {
     type SyscallDriverLookup = Self;
     type SyscallFilter = system_call_filter::DynamicPoliciesCustomFilter;
-    type ProcessFault = <nrf52840dk_lib::Platform as KernelResources<Chip>>::ProcessFault;
-    type Scheduler = <nrf52840dk_lib::Platform as KernelResources<Chip>>::Scheduler;
-    type SchedulerTimer = <nrf52840dk_lib::Platform as KernelResources<Chip>>::SchedulerTimer;
-    type WatchDog = <nrf52840dk_lib::Platform as KernelResources<Chip>>::WatchDog;
+    type ProcessFault = <nrf52840dk_lib::Platform as KernelResources<ChipHw>>::ProcessFault;
+    type Scheduler = <nrf52840dk_lib::Platform as KernelResources<ChipHw>>::Scheduler;
+    type SchedulerTimer = <nrf52840dk_lib::Platform as KernelResources<ChipHw>>::SchedulerTimer;
+    type WatchDog = <nrf52840dk_lib::Platform as KernelResources<ChipHw>>::WatchDog;
     type ContextSwitchCallback =
-        <nrf52840dk_lib::Platform as KernelResources<Chip>>::ContextSwitchCallback;
+        <nrf52840dk_lib::Platform as KernelResources<ChipHw>>::ContextSwitchCallback;
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         self
@@ -213,8 +212,6 @@ pub unsafe fn main() {
     let (board_kernel, base_platform, chip, nrf52840_peripherals, _mux_alarm) =
         nrf52840dk_lib::start();
 
-    CHIP = Some(chip);
-
     //--------------------------------------------------------------------------
     // SCREEN
     //--------------------------------------------------------------------------
@@ -222,8 +219,8 @@ pub unsafe fn main() {
     let i2c_bus = components::i2c::I2CMuxComponent::new(&nrf52840_peripherals.nrf52.twi1, None)
         .finalize(components::i2c_mux_component_static!(nrf52840::i2c::TWI));
     nrf52840_peripherals.nrf52.twi1.configure(
-        nrf52840::pinmux::Pinmux::new(SCREEN_I2C_SCL_PIN as u32),
-        nrf52840::pinmux::Pinmux::new(SCREEN_I2C_SDA_PIN as u32),
+        nrf52840::pinmux::Pinmux::new(SCREEN_I2C_SCL_PIN),
+        nrf52840::pinmux::Pinmux::new(SCREEN_I2C_SDA_PIN),
     );
     nrf52840_peripherals
         .nrf52
@@ -244,23 +241,23 @@ pub unsafe fn main() {
         .finalize(components::sh1106_component_static!(nrf52840::i2c::TWI));
 
     let apps_regions = kernel::static_init!(
-        [capsules_extra::screen_shared::AppScreenRegion; 3],
+        [capsules_extra::screen::screen_shared::AppScreenRegion; 3],
         [
-            capsules_extra::screen_shared::AppScreenRegion::new(
+            capsules_extra::screen::screen_shared::AppScreenRegion::new(
                 create_short_id_from_name("process_manager", 0x0),
                 0,      // x
                 0,      // y
                 16 * 8, // width
                 7 * 8   // height
             ),
-            capsules_extra::screen_shared::AppScreenRegion::new(
+            capsules_extra::screen::screen_shared::AppScreenRegion::new(
                 create_short_id_from_name("counter", 0x0),
                 0,     // x
                 7 * 8, // y
                 8 * 8, // width
                 1 * 8  // height
             ),
-            capsules_extra::screen_shared::AppScreenRegion::new(
+            capsules_extra::screen::screen_shared::AppScreenRegion::new(
                 create_short_id_from_name("temperature", 0x0),
                 8 * 8, // x
                 7 * 8, // y
@@ -272,7 +269,7 @@ pub unsafe fn main() {
 
     let screen = components::screen::ScreenSharedComponent::new(
         board_kernel,
-        capsules_extra::screen::DRIVER_NUM,
+        capsules_extra::screen::screen::DRIVER_NUM,
         ssd1306_sh1106,
         apps_regions,
     )

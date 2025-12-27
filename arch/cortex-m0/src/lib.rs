@@ -14,6 +14,7 @@ pub use cortexm::support;
 
 pub use cortexm::nvic;
 pub use cortexm::syscall;
+pub use cortexm::thread_id;
 
 #[cfg(any(doc, all(target_arch = "arm", target_os = "none")))]
 struct HardFaultStackedRegisters {
@@ -44,7 +45,6 @@ unsafe extern "C" fn hard_fault_handler_kernel(faulting_stack: *mut u32) -> ! {
 
     panic!(
         "Kernel HardFault.\r\n\
-         \tKernel version {}\r\n\
          \tr0  0x{:x}\r\n\
          \tr1  0x{:x}\r\n\
          \tr2  0x{:x}\r\n\
@@ -54,7 +54,6 @@ unsafe extern "C" fn hard_fault_handler_kernel(faulting_stack: *mut u32) -> ! {
          \tpc  0x{:x}\r\n\
          \txpsr  0x{:x}\r\n\
          ",
-        option_env!("TOCK_KERNEL_VERSION").unwrap_or("unknown"),
         hardfault_stacked_registers.r0,
         hardfault_stacked_registers.r1,
         hardfault_stacked_registers.r2,

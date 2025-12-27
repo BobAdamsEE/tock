@@ -67,6 +67,7 @@ macro_rules! count_expressions {
 }
 
 /// Executables must specify their stack size by using the `stack_size!` macro.
+///
 /// It takes a single argument, the desired stack size in bytes. Example:
 /// ```
 /// kernel::stack_size!{0x1000}
@@ -78,8 +79,17 @@ macro_rules! count_expressions {
 macro_rules! stack_size {
     {$size:expr} => {
         /// Size to allocate for the stack.
+        ///
+        /// This creates a static buffer inserted into the `.stack_buffer`
+        /// section that the linker script picks up and places at the correct
+        /// location in RAM.
+        ///
+        /// When compiling for a macOS host, this section attribute is elided as
+        /// it is incompatible with Mach-O objects and yields the following
+        /// error: `mach-o section specifier requires a segment and section
+        /// separated by a comma`.
+        #[cfg_attr(not(target_os = "macos"), link_section = ".stack_buffer")]
         #[no_mangle]
-        #[link_section = ".stack_buffer"]
         static mut STACK_MEMORY: [u8; $size] = [0; $size];
     }
 }

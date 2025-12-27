@@ -21,21 +21,28 @@ use imxrt1060::iomuxc::{MuxMode, PadId, Sion};
 use imxrt10xx as imxrt1060;
 use kernel::capabilities;
 use kernel::component::Component;
+use kernel::debug::PanicResources;
 use kernel::hil::{gpio::Configure, led::LedHigh};
 use kernel::platform::chip::ClockInterface;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
-use kernel::process::ProcessArray;
-use kernel::scheduler::round_robin::RoundRobinSched;
+use kernel::utilities::single_thread_value::SingleThreadValue;
 use kernel::{create_capability, static_init};
 
 /// Number of concurrent processes this platform supports
 const NUM_PROCS: usize = 4;
 
-/// Static variables used by io.rs.
-static mut PROCESSES: Option<&'static ProcessArray<NUM_PROCS>> = None;
+type ChipHw = imxrt1060::chip::Imxrt10xx<imxrt1060::chip::Imxrt10xxDefaultPeripherals>;
+type ProcessPrinterInUse = capsules_system::process_printer::ProcessPrinterText;
+
+/// Resources for when a board panics used by io.rs.
+static PANIC_RESOURCES: SingleThreadValue<PanicResources<ChipHw, ProcessPrinterInUse>> =
+    SingleThreadValue::new(PanicResources::new());
+
 /// What should we do if a process faults?
 const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
     capsules_system::process_policies::PanicFaultPolicy {};
+
+type SchedulerInUse = components::sched::round_robin::RoundRobinComponentType;
 
 /// Teensy 4 platform
 struct Teensy40 {
@@ -54,7 +61,7 @@ struct Teensy40 {
         >,
     >,
 
-    scheduler: &'static RoundRobinSched<'static>,
+    scheduler: &'static SchedulerInUse,
     systick: cortexm7::systick::SysTick,
 }
 
@@ -79,7 +86,7 @@ impl KernelResources<imxrt1060::chip::Imxrt10xx<imxrt1060::chip::Imxrt10xxDefaul
     type SyscallDriverLookup = Self;
     type SyscallFilter = ();
     type ProcessFault = ();
-    type Scheduler = RoundRobinSched<'static>;
+    type Scheduler = SchedulerInUse;
     type SchedulerTimer = cortexm7::systick::SysTick;
     type WatchDog = ();
     type ContextSwitchCallback = ();
@@ -133,11 +140,6 @@ mod dma_config {
     }
 }
 
-type Chip = imxrt1060::chip::Imxrt10xx<imxrt1060::chip::Imxrt10xxDefaultPeripherals>;
-static mut CHIP: Option<&'static Chip> = None;
-static mut PROCESS_PRINTER: Option<&'static capsules_system::process_printer::ProcessPrinterText> =
-    None;
-
 /// Set the ARM clock frequency to 600MHz
 ///
 /// You should use this early in program initialization, before there's a chance
@@ -176,8 +178,16 @@ fn set_arm_clock(ccm: &imxrt1060::ccm::Ccm, ccm_analog: &imxrt1060::ccm_analog::
 /// removed when this function returns. Otherwise, the stack space used for
 /// these static_inits is wasted.
 #[inline(never)]
-unsafe fn start() -> (&'static kernel::Kernel, Teensy40, &'static Chip) {
+unsafe fn start() -> (&'static kernel::Kernel, Teensy40, &'static ChipHw) {
     imxrt1060::init();
+
+    // Initialize deferred calls very early.
+    kernel::deferred_call::initialize_deferred_call_state::<
+        <ChipHw as kernel::platform::chip::Chip>::ThreadIdProvider,
+    >();
+
+    // Bind global variables to this thread.
+    PANIC_RESOURCES.bind_to_thread::<<ChipHw as kernel::platform::chip::Chip>::ThreadIdProvider>();
 
     let ccm = static_init!(imxrt1060::ccm::Ccm, imxrt1060::ccm::Ccm::new());
     let peripherals = static_init!(
@@ -247,15 +257,19 @@ unsafe fn start() -> (&'static kernel::Kernel, Teensy40, &'static Chip) {
     cortexm7::nvic::Nvic::new(imxrt1060::nvic::GPT1).enable();
     dma_config::enable_interrupts();
 
-    let chip = static_init!(Chip, Chip::new(peripherals));
-    CHIP = Some(chip);
+    let chip = static_init!(ChipHw, ChipHw::new(peripherals));
+    PANIC_RESOURCES.get().map(|resources| {
+        resources.chip.put(chip);
+    });
 
     // Start loading the kernel
 
     // Create an array to hold process references.
     let processes = components::process_array::ProcessArrayComponent::new()
         .finalize(components::process_array_component_static!(NUM_PROCS));
-    PROCESSES = Some(processes);
+    PANIC_RESOURCES.get().map(|resources| {
+        resources.processes.put(processes.as_slice());
+    });
 
     // Setup space to store the core kernel data structure.
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(processes.as_slice()));
@@ -265,7 +279,9 @@ unsafe fn start() -> (&'static kernel::Kernel, Teensy40, &'static Chip) {
     let uart_mux = components::console::UartMuxComponent::new(&peripherals.lpuart2, 115_200)
         .finalize(components::uart_mux_component_static!());
     // Create the debugger object that handles calls to `debug!()`
-    components::debug_writer::DebugWriterComponent::new(
+    components::debug_writer::DebugWriterComponent::new::<
+        <ChipHw as kernel::platform::chip::Chip>::ThreadIdProvider,
+    >(
         uart_mux,
         create_capability!(capabilities::SetDebugWriterCapability),
     )
@@ -311,7 +327,9 @@ unsafe fn start() -> (&'static kernel::Kernel, Teensy40, &'static Chip) {
 
     let process_printer = components::process_printer::ProcessPrinterTextComponent::new()
         .finalize(components::process_printer_text_component_static!());
-    PROCESS_PRINTER = Some(process_printer);
+    PANIC_RESOURCES.get().map(|resources| {
+        resources.printer.put(process_printer);
+    });
 
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(processes)
         .finalize(components::round_robin_component_static!(NUM_PROCS));
@@ -375,13 +393,7 @@ pub unsafe fn main() {
     board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }
 
-/// Space for the stack buffer
-///
-/// Justified in tock's `kernel_layout.ld`.
-#[no_mangle]
-#[link_section = ".stack_buffer"]
-#[used]
-static mut STACK_BUFFER: [u8; 0x2000] = [0; 0x2000];
+kernel::stack_size! {0x2000}
 
 const FCB_SIZE: usize = core::mem::size_of::<fcb::FCB>();
 
@@ -392,7 +404,11 @@ const FCB_SIZE: usize = core::mem::size_of::<fcb::FCB>();
 ///
 /// See justification for the `".stack_buffer"` section to understand why we need
 /// explicit padding for the FCB.
+///
+/// When compiling for a macOS host, the `link_section` attribute is elided as
+/// it yields the following error: `mach-o section specifier requires a segment
+/// and section separated by a comma`.
+#[cfg_attr(not(target_os = "macos"), link_section = ".fcb_buffer")]
 #[no_mangle]
-#[link_section = ".fcb_buffer"]
 #[used]
 static mut FCB_BUFFER: [u8; 0x1000 - FCB_SIZE] = [0xFF; 0x1000 - FCB_SIZE];
