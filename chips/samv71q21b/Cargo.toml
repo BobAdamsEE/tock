@@ -3,7 +3,7 @@
 # Copyright Tock Contributors 2025.
 
 [package]
-name = "atsamv71q21b"
+name = "samv71q21b"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

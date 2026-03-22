@@ -3,34 +3,29 @@
 
 use core::arch::asm;
 
-use atsamv71q21b::gpio::{GPIOPin, PortA};
+use panic_halt as _;
 
-// Import the Tock GPIO HIL traits
-use kernel::hil::gpio::{Configure, Output};
+use atsamv71q21b::gpio::PortA;
+use kernel::hil::gpio::Configure; // This fixes make_output
 
-#[no_mangle]
-pub unsafe fn reset_handler() {
-    // Create PortA instance./target/thumbv7em-none-eabihf/release/sam_v71_xult
+use cortex_m_rt::entry;
+
+#[entry]
+fn main() -> ! {
     let porta = PortA::new_port_a();
 
-    // Get PA23
-    let pa23 = porta.pin(23);
+    let mut pa23 = porta.pin(23);
 
-    // Now the methods are available
-    pa23.make_output(); // Configure as output
-    pa23.clear(); // Active-low: clear = turn LED ON
+    pa23.make_output(); // Now compiles
+    pa23.clear(); // Active-low: turns LED ON
 
     loop {
         pa23.toggle();
 
-        // Rough delay — tune if needed (post-reset clock is slow, ~4-8 MHz)
-        for _ in 0..3_000_000 {
-            asm!("nop");
+        for _ in 0..20_000_000 {
+            unsafe {
+                asm!("nop");
+            }
         }
     }
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
 }
