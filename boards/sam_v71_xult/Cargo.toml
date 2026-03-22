@@ -6,9 +6,12 @@ edition = "2021"
 
 [dependencies]
 kernel = { path = "../../kernel" }  # Remove features = ["alloc"]
-capsules-core = { path = "../../capsules/core" }
-capsules-extra = { path = "../../capsules/extra" }
-atsamv71q21b = { path = "../../chips/atsamv71q21b" }
+# capsules-core = { path = "../../capsules/core" }
+# capsules-extra = { path = "../../capsules/extra" }
+samv71q21b = { path = "../../chips/samv71q21b" }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
 
 # Remove [profile.release] and [profile.dev] sections entirely
 # (They are ignored here; Tock sets optimizations globally if needed)

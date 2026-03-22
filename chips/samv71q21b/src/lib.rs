@@ -12,6 +12,8 @@
 pub mod chip;
 pub mod gpio;
 pub mod nvic;
+pub mod pmc;
+pub mod gpbr;
 
 // Peripherals
 // pub mod ccm;
