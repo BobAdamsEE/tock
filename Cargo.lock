@@ -575,6 +575,7 @@ dependencies = [
  "capsules-system",
  "components",
  "cortexm7",
+ "imxrt10xx",
  "kernel",
  "tock_build_scripts",
 ]

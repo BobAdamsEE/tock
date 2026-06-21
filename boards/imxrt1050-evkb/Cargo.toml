@@ -13,7 +13,7 @@ edition.workspace = true
 components = { path = "../components" }
 cortexm7 = { path = "../../arch/cortex-m7" }
 kernel = { path = "../../kernel" }
-atsamv71q21b = { path = "../../chips/atsamv71q21b" }
+imxrt10xx = { path = "../../chips/imxrt10xx" }
 
 capsules-core = { path = "../../capsules/core" }
 capsules-extra = { path = "../../capsules/extra" }
