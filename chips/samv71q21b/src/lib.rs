@@ -10,10 +10,13 @@
 #![no_std]
 
 pub mod chip;
+pub mod efc;
 pub mod gpio;
+pub mod gpbr;
 pub mod nvic;
 pub mod pmc;
-pub mod gpbr;
+pub mod tc;
+pub mod uart;
 
 // Peripherals
 // pub mod ccm;
@@ -145,5 +148,9 @@ pub unsafe fn init() {
 
     cortexm7::scb::set_vector_table_offset(core::ptr::addr_of!(BASE_VECTORS) as *const ());
 
-    cortexm7::nvic::enable_all();
+    // Do NOT call enable_all() here — the bootloader only handles a few
+    // interrupts (USART, EFC, PIOx).  Enabling every NVIC line causes
+    // service_pending_interrupts() to panic on the first unhandled
+    // peripheral (RSTC, SUPC, PMC …).  main.rs enables exactly the
+    // lines it needs.
 }

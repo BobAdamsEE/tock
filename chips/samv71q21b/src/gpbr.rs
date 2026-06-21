@@ -77,7 +77,7 @@ impl Gpbr {
         }
     }
 
-    pub fn set(&mut self, index: GpbrIndex, value: u32) {
+    pub fn set(&self, index: GpbrIndex, value: u32) {
         // No panic needed — exhaustive match
         match index {
             GpbrIndex::Gpbr0 => self.registers.gpbr0.set(value),
