@@ -5,7 +5,8 @@
 //! Power Management Controller (PMC) for SAMV71Q21B.
 //!
 //! Configures clocks for the SAMV71 Xplained Ultra evaluation board:
-//!   - External 12 MHz crystal → PLLA ×25 = 300 MHz (PCK / processor clock)
+//!   - Attempts external 12 MHz crystal → PLLA ×25 = 300 MHz (PCK)
+//!   - Falls back to internal RC if crystal does not start
 //!   - MCK (master/peripheral clock) = PCK / 2 = 150 MHz  (MDIV = PCK_DIV2)
 //!
 //! UART baud rate at MCK = 150 MHz:
@@ -246,11 +247,16 @@ impl Pmc {
 
     /// Configure clocks for the SAMV71 Xplained Ultra board.
     ///
-    /// After this call:
-    ///   - PCK (Cortex-M7 core) = 300 MHz
-    ///   - MCK (peripheral bus)  = 150 MHz
+    /// Tries the external 12 MHz crystal first. If MOSCXTS does not
+    /// go high within the timeout, falls back to the internal RC
+    /// oscillator and adapts the PLLA multiplier to whatever MOSCRCF
+    /// frequency is currently selected.
     ///
-    /// UART baud rate at MCK = 150 MHz: CD = 150 000 000 / (16 × 115 200) = 81.
+    /// After this call:
+    ///   - PCK (Cortex-M7 core) = 300 MHz  (296 MHz in 8 MHz RC fallback)
+    ///   - MCK (peripheral bus)  = 150 MHz  (148 MHz in 8 MHz RC fallback)
+    ///
+    /// UART baud rate at MCK ≈ 150 MHz: CD = 81.
     pub fn setup_clocks(&self) {
         self.disable_write_protection();
 
@@ -260,16 +266,55 @@ impl Pmc {
         self.regs.pmc_mckr.modify(PmcMckr::CSS::Main);
         while !self.regs.pmc_sr.is_set(PmcSr::MCKRDY) {}
 
-        // CKGR_MOR survives software resets (only POR clears it), so the
-        // RC frequency may be 4, 8, or 12 MHz depending on what a prior
-        // boot left behind.  Read the current MOSCRCF and pick the PLLA
-        // multiplier that produces ~300 MHz.
-        let moscrcf = self.regs.ckgr_mor.read(CkgrMor::MOSCRCF);
-        let mula = match moscrcf {
-            0 => 74, // 4 MHz × 75 = 300 MHz
-            1 => 36, // 8 MHz × 37 = 296 MHz
-            _ => 24, // 12 MHz × 25 = 300 MHz
-        };
+        // ---------------------------------------------------------------
+        // Attempt external 12 MHz crystal startup.
+        //
+        // Enable the crystal oscillator with maximum startup time:
+        // MOSCXTST=255 → (255+1) × 8 slow-clock cycles ≈ 62 ms.
+        // Keep MOSCRCEN=1 so the internal RC continues running as
+        // the active MAINCK source while the crystal stabilises.
+        // ---------------------------------------------------------------
+        self.regs.ckgr_mor.modify(
+            CkgrMor::KEY.val(MOR_KEY)
+                + CkgrMor::MOSCXTEN::SET
+                + CkgrMor::MOSCXTST.val(255),
+        );
+
+        // Poll MOSCXTS with a timeout. At the slowest RC (4 MHz) and
+        // ~10 cycles per iteration, 500 000 iterations ≈ 1.25 s — well
+        // beyond the 62 ms hardware startup window.
+        let mut crystal_ok = false;
+        for _ in 0..500_000u32 {
+            if self.regs.pmc_sr.is_set(PmcSr::MOSCXTS) {
+                crystal_ok = true;
+                break;
+            }
+        }
+
+        let mula;
+        if crystal_ok {
+            // Switch MAINCK to the external crystal.
+            self.regs.ckgr_mor.modify(
+                CkgrMor::KEY.val(MOR_KEY) + CkgrMor::MOSCSEL::SET,
+            );
+            while !self.regs.pmc_sr.is_set(PmcSr::MOSCSELS) {}
+
+            // 12 MHz × 25 = 300 MHz — deterministic, no MOSCRCF ambiguity.
+            mula = 24;
+        } else {
+            // Crystal did not start — fall back to internal RC.
+            //
+            // CKGR_MOR survives software resets (only POR clears it), so
+            // the RC frequency may be 4, 8, or 12 MHz depending on what
+            // a prior boot left behind. Pick a PLLA multiplier that
+            // produces ~300 MHz from the current RC frequency.
+            let moscrcf = self.regs.ckgr_mor.read(CkgrMor::MOSCRCF);
+            mula = match moscrcf {
+                0 => 74, // 4 MHz × 75 = 300 MHz
+                1 => 36, // 8 MHz × 37 = 296 MHz
+                _ => 24, // 12 MHz × 25 = 300 MHz
+            };
+        }
 
         self.regs.ckgr_pllar.write(
             CkgrPllar::ONE::SET

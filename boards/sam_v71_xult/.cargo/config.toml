@@ -1,5 +1,14 @@
 [build]
 target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
 rustflags = [
-  "--cfg", "board=\"sam_v71_xult\"",
+  "-C", "linker=rust-lld",
+  "-C", "linker-flavor=ld.lld",
+  "-C", "relocation-model=static",
+  "-C", "link-arg=-zmax-page-size=512",
+  "--cfg", "cfg_tock_buildflagssentinel",
 ]
+
+[unstable]
+build-std = ["core"]

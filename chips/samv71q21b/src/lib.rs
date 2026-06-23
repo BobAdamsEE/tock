@@ -17,6 +17,7 @@ pub mod nvic;
 pub mod pmc;
 pub mod tc;
 pub mod uart;
+pub mod xdmac;
 
 // Peripherals
 // pub mod ccm;
