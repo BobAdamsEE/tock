@@ -12,6 +12,7 @@ use crate::efc;
 use crate::nvic;
 use crate::tc;
 use crate::uart;
+use crate::xdmac;
 
 pub struct Atsamv71q21b<I: InterruptService + 'static> {
     mpu: cortexm7::mpu::MPU,
@@ -38,6 +39,7 @@ pub struct Atsamv71q21bDefaultPeripherals {
     pub usart1: uart::Usart1<'static>,
     pub tc0: tc::Tc<'static>,
     pub efc: efc::Efc,
+    pub xdmac: xdmac::Xdmac,
 }
 
 impl Atsamv71q21bDefaultPeripherals {
@@ -51,6 +53,7 @@ impl Atsamv71q21bDefaultPeripherals {
             usart1: uart::Usart1::new(),
             tc0: tc::Tc::new(),
             efc: efc::Efc::new(),
+            xdmac: xdmac::Xdmac::new(),
         }
     }
 }
@@ -60,6 +63,7 @@ impl InterruptService for Atsamv71q21bDefaultPeripherals {
         match interrupt {
             nvic::EFC      => self.efc.handle_interrupt(),
             nvic::USART1   => self.usart1.handle_interrupt(),
+            nvic::XDMAC    => { self.xdmac.handle_interrupt(); }
             nvic::TC0_CH0  => self.tc0.handle_interrupt(),
             nvic::PIOA     => self.pa.handle_interrupt(),
             nvic::PIOB     => self.pb.handle_interrupt(),

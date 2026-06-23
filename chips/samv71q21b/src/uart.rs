@@ -17,6 +17,8 @@ use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnl
 use kernel::utilities::StaticRef;
 use kernel::ErrorCode;
 
+use crate::xdmac::{self, Xdmac};
+
 // ---------------------------------------------------------------------------
 // Register layout (identical to SAM4L USART – same Microchip IP)
 // ---------------------------------------------------------------------------
@@ -117,6 +119,17 @@ pub const USART1_PID: u32 = 14;
 // MCK = 150 MHz after PMC setup.
 const MCK_HZ: u32 = 150_000_000;
 
+/// USART1 RHR physical address (source for DMA receive).
+const USART1_RHR_ADDR: u32 = 0x4002_8018;
+
+/// Multiplier applied to the interbyte_timeout value (u8) before
+/// programming into the 17-bit RTOR register. A larger RTOR value
+/// tolerates gaps introduced by the EDBG USB-CDC bridge between USB
+/// packets, preventing premature timeout during multi-packet commands
+/// like WritePage. With DMA receive the CPU is not in the data path,
+/// so a moderate multiplier suffices.
+const RTOR_MULTIPLIER: u32 = 5;
+
 #[derive(Copy, Clone, PartialEq)]
 enum TxState {
     Idle,
@@ -128,6 +141,7 @@ enum TxState {
 enum RxState {
     Idle,
     Receiving,
+    ReceivingDma,
 }
 
 pub struct Usart1<'a> {
@@ -142,6 +156,7 @@ pub struct Usart1<'a> {
     rx_len: Cell<usize>,
     rx_pos: Cell<usize>,
     rx_state: Cell<RxState>,
+    xdmac: OptionalCell<&'static Xdmac>,
 }
 
 impl<'a> Usart1<'a> {
@@ -158,14 +173,56 @@ impl<'a> Usart1<'a> {
             rx_len: Cell::new(0),
             rx_pos: Cell::new(0),
             rx_state: Cell::new(RxState::Idle),
+            xdmac: OptionalCell::empty(),
         }
+    }
+
+    pub fn set_xdmac(&self, xdmac: &'static Xdmac) {
+        self.xdmac.set(xdmac);
     }
 
     pub fn handle_interrupt(&self) {
         let csr = self.regs.csr.extract();
         let imr = self.regs.imr.extract();
 
-        // ---- RX errors ------------------------------------------------
+        // ---- DMA RX: overrun error ------------------------------------
+        // With DMA active, RXRDY is not enabled as an interrupt; the
+        // XDMAC reads RHR via hardware handshake. OVRE fires if the DMA
+        // can't keep up (shouldn't happen) or if CUBC reached zero and
+        // bytes keep arriving.
+        if csr.is_set(Csr::OVRE) && self.rx_state.get() == RxState::ReceivingDma {
+            self.regs.idr.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
+            self.regs.cr.write(Cr::RSTSTA::SET);
+            self.regs.rtor.write(Rtor::TO.val(0));
+            self.xdmac.map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
+            let received = self.xdmac.map_or(0, |x| x.usart1_rx_transferred() as usize);
+            if let Some(buf) = self.rx_buffer.take() {
+                self.rx_state.set(RxState::Idle);
+                self.rx_client.map(|c| {
+                    c.received_buffer(buf, received, Err(ErrorCode::FAIL), hil::uart::Error::OverrunError)
+                });
+            }
+            return;
+        }
+
+        // ---- DMA RX: timeout (normal completion) ----------------------
+        if csr.is_set(Csr::TIMEOUT) && imr.is_set(Ir::TIMEOUT)
+            && self.rx_state.get() == RxState::ReceivingDma
+        {
+            self.regs.idr.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
+            self.regs.rtor.write(Rtor::TO.val(0));
+            self.xdmac.map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
+            let received = self.xdmac.map_or(0, |x| x.usart1_rx_transferred() as usize);
+            if let Some(buf) = self.rx_buffer.take() {
+                self.rx_state.set(RxState::Idle);
+                self.rx_client.map(|c| {
+                    c.received_buffer(buf, received, Ok(()), hil::uart::Error::None)
+                });
+            }
+            return;
+        }
+
+        // ---- Interrupt-driven RX errors -------------------------------
         if (csr.is_set(Csr::OVRE) || csr.is_set(Csr::FRAME) || csr.is_set(Csr::PARE))
             && imr.is_set(Ir::RXRDY)
         {
@@ -187,7 +244,7 @@ impl<'a> Usart1<'a> {
             return;
         }
 
-        // ---- RX timeout -----------------------------------------------
+        // ---- Interrupt-driven RX timeout ------------------------------
         if csr.is_set(Csr::TIMEOUT) && imr.is_set(Ir::TIMEOUT) {
             self.regs.idr.write(Ir::RXRDY::SET + Ir::TIMEOUT::SET);
             self.regs.rtor.write(Rtor::TO.val(0));
@@ -200,13 +257,9 @@ impl<'a> Usart1<'a> {
             return;
         }
 
-        // ---- RX data ready --------------------------------------------
+        // ---- Interrupt-driven RX data ready ---------------------------
         if csr.is_set(Csr::RXRDY) && imr.is_set(Ir::RXRDY) {
             let byte = self.regs.rhr.read(Rhr::RXCHR) as u8;
-            // The timeout counter auto-reloads from RTOR on each character
-            // reception (hardware).  Do NOT write STTTO here — on SAMV71 it
-            // resets the counter to "wait for next character" mode, preventing
-            // the timeout from firing after the last byte.
             self.rx_buffer.map(|buf| {
                 let pos = self.rx_pos.get();
                 if pos < buf.len() {
@@ -372,16 +425,29 @@ impl<'a> hil::uart::Receive<'a> for Usart1<'a> {
     }
 
     fn receive_abort(&self) -> Result<(), ErrorCode> {
-        if self.rx_state.get() == RxState::Idle {
+        let state = self.rx_state.get();
+        if state == RxState::Idle {
             return Ok(());
         }
-        self.regs.idr.write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
-        self.regs.rtor.write(Rtor::TO.val(0));
-        self.rx_state.set(RxState::Idle);
-        if let Some(buf) = self.rx_buffer.take() {
-            let pos = self.rx_pos.get();
-            self.rx_client
-                .map(|c| c.received_buffer(buf, pos, Err(ErrorCode::CANCEL), hil::uart::Error::Aborted));
+        if state == RxState::ReceivingDma {
+            self.xdmac.map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
+            self.regs.idr.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
+            let received = self.xdmac.map_or(0, |x| x.usart1_rx_transferred() as usize);
+            self.regs.rtor.write(Rtor::TO.val(0));
+            self.rx_state.set(RxState::Idle);
+            if let Some(buf) = self.rx_buffer.take() {
+                self.rx_client
+                    .map(|c| c.received_buffer(buf, received, Err(ErrorCode::CANCEL), hil::uart::Error::Aborted));
+            }
+        } else {
+            self.regs.idr.write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+            self.regs.rtor.write(Rtor::TO.val(0));
+            self.rx_state.set(RxState::Idle);
+            if let Some(buf) = self.rx_buffer.take() {
+                let pos = self.rx_pos.get();
+                self.rx_client
+                    .map(|c| c.received_buffer(buf, pos, Err(ErrorCode::CANCEL), hil::uart::Error::Aborted));
+            }
         }
         Err(ErrorCode::BUSY)
     }
@@ -406,14 +472,39 @@ impl<'a> hil::uart::ReceiveAdvanced<'a> for Usart1<'a> {
         }
         self.rx_len.set(rx_len);
         self.rx_pos.set(0);
-        self.rx_state.set(RxState::Receiving);
-        self.rx_buffer.replace(rx_buffer);
-        // Program timeout (in bit periods) and start counting.
-        self.regs.rtor.write(Rtor::TO.val(interbyte_timeout as u32));
-        self.regs.cr.write(Cr::STTTO::SET);
-        self.regs
-            .ier
-            .write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+
+        // Use DMA receive when XDMAC is available. The XDMAC reads
+        // bytes from USART1 RHR directly into the buffer via hardware
+        // handshake, eliminating per-byte CPU interrupts. The USART
+        // RTOR timeout still fires after the last byte, at which point
+        // we stop the DMA and deliver the buffer.
+        if let Some(xdmac) = self.xdmac.get() {
+            let dst_addr = rx_buffer.as_ptr() as u32;
+            self.rx_state.set(RxState::ReceivingDma);
+            self.rx_buffer.replace(rx_buffer);
+
+            xdmac.configure_periph_to_mem(
+                xdmac::USART1_RX_CHANNEL,
+                xdmac::USART1_RX_PERID,
+                USART1_RHR_ADDR,
+                dst_addr,
+                rx_len as u32,
+            );
+            xdmac.enable_channel(xdmac::USART1_RX_CHANNEL);
+
+            let to = interbyte_timeout as u32 * RTOR_MULTIPLIER;
+            self.regs.rtor.write(Rtor::TO.val(to));
+            self.regs.cr.write(Cr::STTTO::SET);
+            self.regs.ier.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
+        } else {
+            self.rx_state.set(RxState::Receiving);
+            self.rx_buffer.replace(rx_buffer);
+            self.regs.rtor.write(Rtor::TO.val(interbyte_timeout as u32));
+            self.regs.cr.write(Cr::STTTO::SET);
+            self.regs
+                .ier
+                .write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+        }
         Ok(())
     }
 }
