@@ -1338,6 +1338,7 @@ name = "sam_v71_xult"
 version = "0.1.0"
 dependencies = [
  "capsules-core",
+ "capsules-extra",
  "capsules-system",
  "components",
  "cortexm7",

@@ -20,6 +20,7 @@ pub mod apds9960;
 pub mod app_flash_driver;
 pub mod app_loader;
 pub mod at24c_eeprom;
+pub mod at24mac402;
 pub mod atecc508a;
 pub mod ble_advertising_driver;
 pub mod bme280;

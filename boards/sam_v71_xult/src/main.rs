@@ -23,7 +23,9 @@ use capsules_system::scheduler::round_robin::RoundRobinSched;
 
 use samv71q21b::chip::{Atsamv71q21b, Atsamv71q21bDefaultPeripherals};
 use samv71q21b::gpio::PeripheralFunction;
+use samv71q21b::mcan;
 use samv71q21b::pmc;
+use samv71q21b::twihs;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -61,6 +63,8 @@ struct SamV71Xult {
             samv71q21b::tc::Tc<'static>,
         >,
     >,
+    /// CAN driver (MCAN1 via ATA6561 transceiver).
+    can: &'static capsules_extra::can::CanCapsule<'static, mcan::Mcan>,
     /// Scheduler.
     scheduler: &'static RoundRobinSched<'static>,
     /// SysTick for preemptive scheduling.
@@ -76,6 +80,7 @@ impl SyscallDriverLookup for SamV71Xult {
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
             capsules_core::led::DRIVER_NUM => f(Some(self.led)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
+            capsules_extra::can::DRIVER_NUM => f(Some(self.can)),
             _ => f(None),
         }
     }
@@ -100,6 +105,40 @@ impl KernelResources<Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> for SamV71Xul
 }
 
 // ---------------------------------------------------------------------------
+// Boot-time EEPROM debug client — prints MAC address on first read
+// ---------------------------------------------------------------------------
+
+/// Prints the AT24MAC402 EUI-48 MAC address and serial number via debug!().
+struct EepromDebugClient;
+
+impl capsules_extra::at24mac402::At24Mac402Client for EepromDebugClient {
+    fn mac_read_complete(&self, mac: &[u8; 6], status: Result<(), kernel::ErrorCode>) {
+        if status.is_ok() {
+            debug!(
+                "AT24MAC402 MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+        } else {
+            debug!("AT24MAC402 MAC read failed");
+        }
+    }
+
+    fn serial_read_complete(&self, serial: &[u8; 16], status: Result<(), kernel::ErrorCode>) {
+        if status.is_ok() {
+            debug!(
+                "AT24MAC402 serial: {:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}",
+                serial[0], serial[1], serial[2], serial[3],
+                serial[4], serial[5], serial[6], serial[7],
+                serial[8], serial[9], serial[10], serial[11],
+                serial[12], serial[13], serial[14], serial[15],
+            );
+        } else {
+            debug!("AT24MAC402 serial read failed");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -115,8 +154,8 @@ pub unsafe fn main() {
         (1u32 << 10) | (1u32 << 11) | (1u32 << 12) | (1u32 << 14),
     );
 
-    // Flash wait states for 150 MHz.
-    core::ptr::write_volatile(0x400E_0C00 as *mut u32, 0x0400_0600);
+    // Flash wait states for 150 MHz (FWS=6). CLOE intentionally OFF.
+    core::ptr::write_volatile(0x400E_0C00 as *mut u32, 0x0000_0600);
 
     samv71q21b::init();
 
@@ -127,9 +166,11 @@ pub unsafe fn main() {
 
     pmc::PMC.setup_clocks();
 
+    let mcan1_msg_ram = static_init!(mcan::MessageRam, mcan::MessageRam::new());
+
     let peripherals = static_init!(
         Atsamv71q21bDefaultPeripherals,
-        Atsamv71q21bDefaultPeripherals::new()
+        Atsamv71q21bDefaultPeripherals::new(mcan1_msg_ram)
     );
     peripherals.efc.init();
 
@@ -139,6 +180,7 @@ pub unsafe fn main() {
     pmc::PMC.enable_peripheral_clock(11); // PIOB
     pmc::PMC.enable_peripheral_clock(12); // PIOC
     pmc::PMC.enable_peripheral_clock(samv71q21b::tc::TC0_CH0_PID);
+    pmc::PMC.enable_peripheral_clock(twihs::TWIHS0_PID);
 
     // Pin mux: USART1 EDBG CDC.
     {
@@ -150,6 +192,29 @@ pub unsafe fn main() {
     }
     peripherals.pa.pin(21).select_peripheral(PeripheralFunction::A);
     peripherals.pb.pin(4).select_peripheral(PeripheralFunction::D);
+
+    // Pin mux: TWIHS0 (I2C0) — PA3 = TWD0/SDA, PA4 = TWCK0/SCL.
+    peripherals.pa.pin(3).select_peripheral(PeripheralFunction::A);
+    peripherals.pa.pin(4).select_peripheral(PeripheralFunction::A);
+
+    // MCAN1: enable peripheral clock + PCK5 as CAN core clock.
+    // SAMV71 MCAN uses PCK5 (not GCLK). PCK5 = PLLA / (14+1) = 20 MHz.
+    // 20 MHz gives exact 87.5% sample point at 500 kbps (40 TQ per bit).
+    pmc::PMC.enable_peripheral_clock(mcan::MCAN1_PID);
+    pmc::PMC.configure_pck(5, 2, 14); // PCK5: CSS=2 (PLLA 300 MHz), PRES=14 → 20 MHz
+
+    // Set MCAN DMA base address (CCFG_CAN0 in Matrix).
+    // The MCAN controller forms message RAM addresses as:
+    //   {CCFG_CAN0.CAN0DMABA[15:0], register_field[13:0], 2'b00}
+    // CAN0DMABA must be the upper 16 bits of the SRAM base (0x2040).
+    {
+        let ccfg_can0 = 0x4008_8110 as *mut u32;
+        core::ptr::write_volatile(ccfg_can0, 0x2040_0000u32);
+    }
+
+    // Pin mux: MCAN1 — PC12 = RX (Peripheral C), PC14 = TX (Peripheral C)
+    peripherals.pc.pin(12).select_peripheral(PeripheralFunction::C);
+    peripherals.pc.pin(14).select_peripheral(PeripheralFunction::C);
 
     // Process array.
     let processes = components::process_array::ProcessArrayComponent::new()
@@ -173,6 +238,9 @@ pub unsafe fn main() {
     cortexm7::nvic::Nvic::new(10).enable(); // PIOA
     cortexm7::nvic::Nvic::new(11).enable(); // PIOB
     cortexm7::nvic::Nvic::new(12).enable(); // PIOC
+    cortexm7::nvic::Nvic::new(twihs::TWIHS0_PID).enable(); // TWIHS0
+    cortexm7::nvic::Nvic::new(mcan::MCAN1_PID).enable();  // MCAN1 INT0
+    cortexm7::nvic::Nvic::new(38).enable();                // MCAN1 INT1
 
     // -----------------------------------------------------------------------
     // Alarm (TC0 @ 32 kHz SLCK)
@@ -224,6 +292,45 @@ pub unsafe fn main() {
     ));
 
     // -----------------------------------------------------------------------
+    // I2C bus (TWIHS0) + AT24MAC402 EEPROM
+    // -----------------------------------------------------------------------
+    let mux_i2c = components::i2c::I2CMuxComponent::new(&peripherals.twihs0, None)
+        .finalize(components::i2c_mux_component_static!(samv71q21b::twihs::Twihs));
+
+    // User EEPROM (256 bytes, R/W) at 0x57.
+    let eeprom_i2c = components::i2c::I2CComponent::new(mux_i2c, 0x57)
+        .finalize(components::i2c_component_static!(samv71q21b::twihs::Twihs));
+
+    // Extended block (MAC + serial, R/O) at 0x5F.
+    let eeprom_i2c_ext = components::i2c::I2CComponent::new(mux_i2c, 0x5F)
+        .finalize(components::i2c_component_static!(samv71q21b::twihs::Twihs));
+
+    let eeprom_buf = static_init!([u8; 18], [0; 18]);
+    let eeprom = static_init!(
+        capsules_extra::at24mac402::At24Mac402<'static>,
+        capsules_extra::at24mac402::At24Mac402::new(eeprom_i2c, eeprom_i2c_ext, eeprom_buf)
+    );
+    eeprom_i2c.set_client(eeprom);
+    eeprom_i2c_ext.set_client(eeprom);
+
+    // Boot-time debug: read and print EUI-48 MAC address.
+    let eeprom_debug = static_init!(EepromDebugClient, EepromDebugClient);
+    eeprom.set_meta_client(eeprom_debug);
+    let _ = eeprom.read_mac_address();
+
+    // -----------------------------------------------------------------------
+    // CAN (MCAN1 @ 500 kbps via ATA6561 transceiver)
+    // -----------------------------------------------------------------------
+    let can = components::can::CanComponent::new(
+        board_kernel,
+        capsules_extra::can::DRIVER_NUM,
+        &peripherals.mcan1,
+    )
+    .finalize(components::can_component_static!(mcan::Mcan));
+
+    kernel::deferred_call::DeferredCallClient::register(&peripherals.mcan1);
+
+    // -----------------------------------------------------------------------
     // Scheduler
     // -----------------------------------------------------------------------
     let scheduler =
@@ -234,6 +341,7 @@ pub unsafe fn main() {
         console,
         led,
         alarm,
+        can,
         scheduler,
         systick: cortexm7::systick::SysTick::new_with_calibration(300_000_000),
     };

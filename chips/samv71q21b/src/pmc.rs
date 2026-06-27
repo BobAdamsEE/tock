@@ -385,4 +385,24 @@ impl Pmc {
         while self.regs.pmc_sr.get() & (1 << (index + 8)) == 0 {}
         self.enable_write_protection();
     }
+
+    /// Configure and enable a peripheral's generic clock (GCLK).
+    ///
+    /// Used by MCAN, I2SC, and other peripherals that require a
+    /// dedicated clock from the PMC generic clock generator.
+    ///
+    /// `pid`: peripheral ID (e.g., 35 for MCAN0, 37 for MCAN1)
+    /// `css`: clock source (0=Slow, 1=Main, 2=PLLA, 3=UPLL, 4=MCK)
+    /// `div`: division factor (output = source / (div + 1))
+    pub fn configure_gclk(&self, pid: u32, css: u32, div: u32) {
+        self.disable_write_protection();
+        let pcr_val = (pid & 0x7F)
+            | (1 << 12)           // CMD (write command)
+            | (1 << 28)           // EN (peripheral clock enable)
+            | (1 << 29)           // GCLKEN (generic clock enable)
+            | ((css & 0x7) << 8)  // GCLKCSS
+            | ((div & 0xFF) << 20); // GCLKDIV
+        self.regs.pmc_pcr.set(pcr_val);
+        self.enable_write_protection();
+    }
 }
