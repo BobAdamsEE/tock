@@ -6,8 +6,8 @@
 //! - Flash size: 2 MB, base address 0x00400000 (aliased at 0x00000000)
 //! - Page size: 512 bytes  →  4096 pages total
 //! - `read_page`:  direct memory copy from physical address (synchronous)
-//! - `write_page`: EPA erase + CPU latch fill + IAP WP (synchronous)
-//! - `erase_page`: no-op; write_page handles erasing
+//! - `write_page`: CLB unlock + CPU latch fill + IAP WP (synchronous)
+//! - `erase_page`: CLB unlock + EPA erase (synchronous)
 //!
 //! Flash programming on the Cortex-M7 SAMV71 requires two workarounds:
 //!
@@ -96,10 +96,13 @@ const CMD_EPA: u32 = 0x07;
 /// CLB – Clear Lock Bit.
 const CMD_CLB: u32 = 0x09;
 
-/// Minimum erase granularity on the 2 MB SAMV71Q21B is 32 pages
-/// (16 KB). EPA FARG[1:0]=3 selects 32-page erase.
-const EPA_ERASE_SIZE: u32 = 3; // FARG[1:0]: 0=4pp, 1=8pp, 2=16pp, 3=32pp
-const EPA_PAGE_ALIGN: u32 = 32;
+/// EPA erase granularity: 16 pages (8 KB) per block.
+/// FARG[1:0]=2 selects 16-page erase.  Using 32-page (FARG=3)
+/// caused tockloader's post-install clear_bytes to erase app data
+/// for small apps like c_hello (16 pages = 8 KB) because the
+/// 32-page alignment rounded down into the app's own pages.
+const EPA_ERASE_SIZE: u32 = 2;
+const EPA_PAGE_ALIGN: u32 = 16;
 
 /// ROM IAP function pointer address (NMI vector in ROM).
 const IAP_ENTRY_ADDR: usize = 0x0080_0008;
@@ -158,8 +161,14 @@ impl Efc {
     }
 
     /// Configure flash wait states for 150 MHz MCK (≥6 wait states).
+    ///
+    /// CLOE (Code Loop Optimization) is intentionally left disabled.
+    /// The EEFC's internal read buffer can serve stale data after
+    /// erase/write operations, causing CRC mismatches during
+    /// tockloader app installs.  The performance cost is negligible
+    /// for Tock's flash access patterns.
     pub fn init(&self) {
-        self.regs.fmr.write(Fmr::FWS.val(6) + Fmr::CLOE::SET);
+        self.regs.fmr.write(Fmr::FWS.val(6));
     }
 
     /// No-op — commands use synchronous IAP; no FRDY interrupt needed.
@@ -180,22 +189,15 @@ impl Efc {
         Self::call_iap(CMD_EPA, epa_arg)
     }
 
-    /// Fill the EEFC page latch by writing 128 words to the flash alias.
+    /// Fill the EEFC page latch and program a flash page — entirely
+    /// from SRAM.
     ///
-    /// This function is placed in SRAM (`.ramfunc` section) so that the
-    /// entire sequence — cache cleanup, MPU setup, copy loop, MPU
-    /// teardown — executes without any flash instruction fetches. On
-    /// Cortex-M7 SAMV71, accumulated I/D-cache and bus-matrix state
-    /// from prior flash accesses prevents the EEFC from capturing
-    /// latch writes if any part of the sequence runs from flash.
-    /// Erase, fill latch, and program a flash page — entirely from SRAM.
+    /// The caller must erase the target page/block beforehand via
+    /// `erase_page`; this function only does CLB + latch fill + WP.
     ///
-    /// The entire sequence (cache cleanup → CLB → EPA → MPU setup →
-    /// latch fill → WP → restore) runs from `.ramfunc` so the CPU
-    /// never fetches instructions from flash during EFC operations.
-    /// Accumulated I/D-cache and bus-matrix state from prior flash
-    /// accesses prevents latch writes from reaching the EEFC if any
-    /// part of the sequence runs from flash.
+    /// The entire sequence (cache cleanup → CLB → latch fill → WP →
+    /// restore) runs from `.ramfunc` so the CPU never fetches
+    /// instructions from flash during EFC operations.
     #[link_section = ".ramfunc"]
     #[inline(never)]
     fn load_latch(page_number: usize, buf: &Sam71Page) -> u32 {
@@ -239,7 +241,8 @@ impl Efc {
                 core::arch::asm!("dsb sy", options(nostack, preserves_flags));
             }
 
-            // --- 2. Re-init EEFC: FWS=6, CLOE OFF ---
+            // --- 2. Re-init EEFC: FWS=6, CLOE OFF for the write ---
+            let fmr_prev = core::ptr::read_volatile(EFC_FMR);
             core::ptr::write_volatile(EFC_FMR, 0x0000_0600);
             core::ptr::read_volatile(EFC_FSR);
             core::ptr::read_volatile(EFC_FSR);
@@ -249,17 +252,9 @@ impl Efc {
             let lock_region = page_number as u32 / 32;
             let clb_fcr = (FKEY << 24) | ((lock_region & 0xFFFF) << 8) | (CMD_CLB & 0xFF);
             iap(0, clb_fcr);
-
-            // --- 4. EPA erase via IAP (from ROM) ---
-            if page_number as u32 % EPA_PAGE_ALIGN == 0 {
-                let first_page = (page_number as u32) & !(EPA_PAGE_ALIGN - 1);
-                let epa_arg = first_page | EPA_ERASE_SIZE;
-                let epa_fcr = (FKEY << 24) | ((epa_arg & 0xFFFF) << 8) | (CMD_EPA & 0xFF);
-                iap(0, epa_fcr);
-            }
             core::arch::asm!("dsb sy", "isb sy", options(nostack, preserves_flags));
 
-            // --- 5. Force I-Code completely idle ---
+            // --- 4. Force I-Code completely idle ---
             // Move vector table to SRAM so NO flash reads can occur
             // (not even for fault handlers or NMI vector).
             const SCB_VTOR: *mut u32 = 0xE000_ED08 as *mut u32;
@@ -279,7 +274,7 @@ impl Efc {
             core::arch::asm!("cpsid i", options(nostack, preserves_flags));
             core::arch::asm!("dsb sy", "isb sy", options(nostack, preserves_flags));
 
-            // --- 5b. Re-configure MATRIX flash slave default master ---
+            // --- 5. Re-configure MATRIX flash slave default master ---
             // The flash slave (SCFG[2]) defaults to Fixed Default
             // Master = I-Code (master 0). The I-Code prefetch unit
             // holds flash access even when running from SRAM, blocking
@@ -295,7 +290,7 @@ impl Efc {
             let scfg3_prev = core::ptr::read_volatile(MATRIX_SCFG3);
             core::ptr::write_volatile(MATRIX_SCFG3, 0x0000_01FF);
 
-            // --- 7. Copy 128 words to flash via inline asm ---
+            // --- 6. Copy 128 words to flash via inline asm ---
             let src = buf.0.as_ptr();
             let dst = page_addr as *mut u8;
             core::arch::asm!(
@@ -313,11 +308,11 @@ impl Efc {
                 options(nostack),
             );
 
-            // --- 8. WP via IAP (from ROM) ---
+            // --- 7. WP via IAP (from ROM) ---
             let wp_fcr = (FKEY << 24) | ((page_number as u32 & 0xFFFF) << 8) | (CMD_WP & 0xFF);
             let fsr = iap(0, wp_fcr);
 
-            // --- 9. Restore NVIC, VTOR, MATRIX, EEFC ---
+            // --- 8. Restore NVIC, VTOR, MATRIX, EEFC ---
             core::ptr::write_volatile(SCB_VTOR, vtor_prev);
             core::ptr::write_volatile(0xE000_E100 as *mut u32, icer0); // ISER0
             core::ptr::write_volatile(0xE000_E104 as *mut u32, icer1);
@@ -325,7 +320,7 @@ impl Efc {
             core::arch::asm!("cpsie i", options(nostack, preserves_flags));
             core::ptr::write_volatile(MATRIX_SCFG2, scfg2_prev);
             core::ptr::write_volatile(MATRIX_SCFG3, scfg3_prev);
-            core::ptr::write_volatile(EFC_FMR, 0x0400_0600);
+            core::ptr::write_volatile(EFC_FMR, fmr_prev);
             core::arch::asm!("dsb sy", "isb sy", options(nostack, preserves_flags));
 
             if ccr & (1 << 17) != 0 {
@@ -384,19 +379,30 @@ impl flash::Flash for Efc {
             return Err((ErrorCode::INVAL, buf));
         }
 
-        // Debug: page number, first data word
-        unsafe {
-            let w0 = u32::from_le_bytes([buf.0[0], buf.0[1], buf.0[2], buf.0[3]]);
-            core::ptr::write_volatile(0x400E_1890 as *mut u32, page_number as u32);
-            core::ptr::write_volatile(0x400E_1894 as *mut u32, w0);
+        // Erase if the page isn't clean. Tockloader may not send
+        // explicit ErasePage commands before WritePage, so we must
+        // handle it here. The EPA erases a 16-page block, but since
+        // tockloader writes pages in ascending order, the block-erase
+        // only hits pages that haven't been written yet.
+        let page_addr = FLASH_BASE + page_number * PAGE_SIZE;
+        let needs_erase = unsafe {
+            let p = page_addr as *const u32;
+            let mut dirty = false;
+            for i in 0..(PAGE_SIZE / 4) {
+                if core::ptr::read_volatile(p.add(i)) != 0xFFFF_FFFF {
+                    dirty = true;
+                    break;
+                }
+            }
+            dirty
+        };
+        if needs_erase {
+            let lock_region = page_number / 32;
+            Self::call_iap(CMD_CLB, lock_region as u32);
+            Self::erase_block(page_number);
         }
 
         let fsr = Self::load_latch(page_number, buf);
-
-        // Debug: WP FSR result
-        unsafe {
-            core::ptr::write_volatile(0x400E_1898 as *mut u32, fsr);
-        }
 
         let result = if fsr & 0x0E != 0 {
             Err(flash::Error::FlashError)
@@ -410,6 +416,28 @@ impl flash::Flash for Efc {
     fn erase_page(&self, page_number: usize) -> Result<(), ErrorCode> {
         if page_number >= PAGE_COUNT {
             return Err(ErrorCode::INVAL);
+        }
+
+        // EPA erases a 16-page (8 KB) block, not a single page.
+        // Skip if the target page is already 0xFF to avoid collateral
+        // erasure of neighboring pages in the same block.
+        let page_addr = FLASH_BASE + page_number * PAGE_SIZE;
+        let already_erased = unsafe {
+            let p = page_addr as *const u32;
+            let mut erased = true;
+            let words = PAGE_SIZE / 4;
+            for i in 0..words {
+                if core::ptr::read_volatile(p.add(i)) != 0xFFFF_FFFF {
+                    erased = false;
+                    break;
+                }
+            }
+            erased
+        };
+
+        if already_erased {
+            self.client.map(|c| c.erase_complete(Ok(())));
+            return Ok(());
         }
 
         let lock_region = page_number / 32;

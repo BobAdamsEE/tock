@@ -9,8 +9,10 @@ use cortexm7::{CortexM7, CortexMVariant};
 use kernel::platform::chip::{Chip, InterruptService};
 
 use crate::efc;
+use crate::mcan;
 use crate::nvic;
 use crate::tc;
+use crate::twihs;
 use crate::uart;
 use crate::xdmac;
 
@@ -40,10 +42,12 @@ pub struct Atsamv71q21bDefaultPeripherals {
     pub tc0: tc::Tc<'static>,
     pub efc: efc::Efc,
     pub xdmac: xdmac::Xdmac,
+    pub twihs0: twihs::Twihs<'static>,
+    pub mcan1: mcan::Mcan,
 }
 
 impl Atsamv71q21bDefaultPeripherals {
-    pub fn new() -> Self {
+    pub fn new(mcan1_msg_ram: &'static mut mcan::MessageRam) -> Self {
         Self {
             pa: crate::gpio::PortA::new_port_a(),
             pb: crate::gpio::PortB::new_port_b(),
@@ -54,6 +58,8 @@ impl Atsamv71q21bDefaultPeripherals {
             tc0: tc::Tc::new(),
             efc: efc::Efc::new(),
             xdmac: xdmac::Xdmac::new(),
+            twihs0: twihs::Twihs::new_twihs0(),
+            mcan1: mcan::Mcan::new_mcan1(mcan1_msg_ram),
         }
     }
 }
@@ -70,6 +76,9 @@ impl InterruptService for Atsamv71q21bDefaultPeripherals {
             nvic::PIOC     => self.pc.handle_interrupt(),
             nvic::PIOD     => self.pd.handle_interrupt(),
             nvic::PIOE     => self.pe.handle_interrupt(),
+            nvic::TWIHS0     => self.twihs0.handle_interrupt(),
+            nvic::MCAN1_INT0 => self.mcan1.handle_interrupt(),
+            nvic::MCAN1_INT1 => self.mcan1.handle_interrupt(),
             _ => return false,
         }
         true
