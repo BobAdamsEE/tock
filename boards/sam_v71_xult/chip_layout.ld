@@ -1,11 +1,13 @@
-/* SAMV71Q21B memory layout for use with the Tock bootloader.
+/* SAMV71Q21B memory layout with tock-bootloader.
  *
- * Bootloader: 0x00000000–0x00007FFF (32 KB)
- * Kernel:     0x00008000–0x0003FFFF (224 KB)
- * Apps:       0x00040000–0x001FFFFF (1792 KB)
+ * Bootloader: 0x00000000–0x00007FFF (32 KB)   physical 0x00400000–0x00407FFF
+ * Kernel:     0x00008000–0x0003FFFF (224 KB)  physical 0x00408000–0x0043FFFF
+ * Apps:       0x00040000–0x001FFFFF (1792 KB) physical 0x00440000–0x005FFFFF
  * SRAM:       0x20400000–0x2045FFFF (384 KB)
  *
- * Flash addresses are in the alias region (0x00000000 maps to 0x00400000). */
+ * Flash addresses are in the alias region (0x00000000 maps to 0x00400000).
+ * The tock-bootloader advertises appaddr="0x40000" to tockloader, which
+ * matches prog ORIGIN here. */
 
 MEMORY
 {

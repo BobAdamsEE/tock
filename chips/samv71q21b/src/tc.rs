@@ -11,7 +11,7 @@
 
 use core::cell::Cell;
 
-use kernel::hil::time::{self, ConvertTicks, Ticks, Ticks32};
+use kernel::hil::time::{self, Ticks, Ticks32};
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly};

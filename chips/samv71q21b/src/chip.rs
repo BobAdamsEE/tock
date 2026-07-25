@@ -79,6 +79,10 @@ impl InterruptService for Atsamv71q21bDefaultPeripherals {
             nvic::TWIHS0     => self.twihs0.handle_interrupt(),
             nvic::MCAN1_INT0 => self.mcan1.handle_interrupt(),
             nvic::MCAN1_INT1 => self.mcan1.handle_interrupt(),
+            // Correctable ECC error — hardware has already corrected the data,
+            // safe to continue. Uncorrectable ECC is a hard fault.
+            nvic::ECC_WARNING => {}
+            nvic::ECC_FAULT => panic!("Uncorrectable ECC fault"),
             _ => return false,
         }
         true

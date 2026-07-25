@@ -391,7 +391,126 @@ pub unsafe fn main() {
 
 #[cfg(not(test))]
 #[panic_handler]
-/// Panic handler.
-pub unsafe fn panic_fmt(_pi: &core::panic::PanicInfo) -> ! {
+/// Panic handler — synchronous UART output then halt.
+///
+/// USART1 is already configured at 115200 by the normal boot path. This handler
+/// bypasses the interrupt-driven ring buffer and writes directly to the Transmit
+/// Holding Register (US_THR) using a busy-wait on TXRDY. This guarantees the
+/// message appears on the EDBG CDC serial port even if NVIC interrupts are
+/// disabled (e.g. during a HardFault).
+pub unsafe fn panic_fmt(pi: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
+
+    // USART1 base 0x4002_8000 — configure it unconditionally so panics that
+    // happen before the driver initialises the hardware still produce output.
+    // Registers used (offsets from base):
+    //   US_CR  +0x00  US_MR  +0x04  US_BRGR +0x20
+    //   US_CSR +0x14  US_THR +0x1C
+    const US_BASE: u32 = 0x4002_8000;
+    const US_CR: *mut u32   = (US_BASE + 0x00) as *mut u32;
+    const US_MR: *mut u32   = (US_BASE + 0x04) as *mut u32;
+    const US_BRGR: *mut u32 = (US_BASE + 0x20) as *mut u32;
+    const US_CSR: *const u32 = (US_BASE + 0x14) as *const u32;
+    const US_THR: *mut u32   = (US_BASE + 0x1C) as *mut u32;
+
+    // Disable TX/RX, then reconfigure: 8-N-1 at MCK (150 MHz) / 16 / 81 ≈ 115 740 bps.
+    // US_MR: USCLKS=0 (MCK/16), CHRL=3 (8 bit), PAR=4 (none), NBSTOP=0 (1 stop).
+    // US_MR value: CHRL[7:6]=0b11, PAR[11:9]=0b100 → 0b_0000_1000_1100_0000 = 0x08C0.
+    // US_CR: RSTRX=1, RSTTX=1, RXDIS=1, TXDIS=1 to reset state first.
+    core::ptr::write_volatile(US_CR, (1 << 2) | (1 << 3) | (1 << 5) | (1 << 7));
+    core::ptr::write_volatile(US_MR, 0x0000_08C0);
+    core::ptr::write_volatile(US_BRGR, 81);
+    // Enable TX.
+    core::ptr::write_volatile(US_CR, 1 << 6); // TXEN
+
+    struct SyncUart;
+    impl Write for SyncUart {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for b in s.bytes() {
+                unsafe {
+                    while core::ptr::read_volatile(US_CSR) & 0x02 == 0 {}
+                    core::ptr::write_volatile(US_THR, b as u32);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut uart = SyncUart;
+    let _ = write!(uart, "\r\n\r\n!!! KERNEL PANIC !!!\r\n{}\r\n", pi);
+
+    // Print fault registers saved by hard_fault_handler when a process faulted.
+    // SCB_REGISTERS = [CCR, CFSR, HFSR, MMFAR, BFAR] saved at fault time.
+    // Only meaningful after "Process X had a fault"; harmless (all zeros) otherwise.
+    extern "C" {
+        static mut SCB_REGISTERS: [u32; 5];
+    }
+    let scb = core::ptr::addr_of!(SCB_REGISTERS);
+    let ccr   = unsafe { (*scb)[0] };
+    let cfsr  = unsafe { (*scb)[1] };
+    let hfsr  = unsafe { (*scb)[2] };
+    let mmfar = unsafe { (*scb)[3] };
+    let bfar  = unsafe { (*scb)[4] };
+    if cfsr != 0 || hfsr != 0 {
+        let _ = write!(uart,
+            "CCR=0x{:08X} (UNALIGN_TRP={} DC={} IC={})\r\n\
+             CFSR=0x{:08X} HFSR=0x{:08X} MMFAR=0x{:08X} BFAR=0x{:08X}\r\n\
+             MemManage: IACCVIOL={} DACCVIOL={} MUNSTKERR={} MSTKERR={} MMFARVALID={}\r\n\
+             BusFault:  IBUSERR={} PRECISERR={} UNSTKERR={} STKERR={} BFARVALID={}\r\n\
+             UsageFault:UNDEFINSTR={} INVSTATE={} INVPC={} NOCP={} UNALIGNED={} DIVBYZERO={}\r\n\
+             HardFault: FORCED={}\r\n",
+            ccr, (ccr >> 3) & 1, (ccr >> 16) & 1, (ccr >> 17) & 1,
+            cfsr, hfsr, mmfar, bfar,
+            (cfsr >> 0) & 1, (cfsr >> 1) & 1, (cfsr >> 3) & 1, (cfsr >> 4) & 1, (cfsr >> 7) & 1,
+            (cfsr >> 8) & 1, (cfsr >> 9) & 1, (cfsr >> 11) & 1, (cfsr >> 12) & 1, (cfsr >> 15) & 1,
+            (cfsr >> 16) & 1, (cfsr >> 17) & 1, (cfsr >> 18) & 1, (cfsr >> 19) & 1,
+            (cfsr >> 24) & 1, (cfsr >> 25) & 1,
+            (hfsr >> 30) & 1,
+        );
+    }
+
+    // Read PSP to get the process exception frame pushed when the fault occurred.
+    // After a process fault the hard_fault_handler returns to the kernel on MSP;
+    // PSP is left pointing at the stacked frame: [r0,r1,r2,r3,r12,lr,PC,xPSR].
+    // Frame[6] (PSP+24) is the instruction address that caused the fault.
+    let psp: u32;
+    unsafe { core::arch::asm!("mrs {}, psp", out(reg) psp) };
+    if psp != 0 && psp & 3 == 0 {
+        let frame = psp as *const u32;
+        let stk_r0   = unsafe { frame.add(0).read_volatile() };
+        let stk_r1   = unsafe { frame.add(1).read_volatile() };
+        let stk_r2   = unsafe { frame.add(2).read_volatile() };
+        let stk_r3   = unsafe { frame.add(3).read_volatile() };
+        let stk_r12  = unsafe { frame.add(4).read_volatile() };
+        let stk_lr   = unsafe { frame.add(5).read_volatile() };
+        let stk_pc   = unsafe { frame.add(6).read_volatile() };
+        let stk_xpsr = unsafe { frame.add(7).read_volatile() };
+        let xpsr_t   = (stk_xpsr >> 24) & 1;   // Thumb bit: must be 1
+        let xpsr_exc = stk_xpsr & 0x1FF;        // exception number: 0 = Thread mode
+        let xpsr_stk = (stk_xpsr >> 9) & 1;    // STKALIGN: 1 = pad word present
+        let _ = write!(uart,
+            "PSP=0x{:08X} stk_PC=0x{:08X} stk_LR=0x{:08X} stk_xPSR=0x{:08X}\r\n\
+             stk_r0=0x{:08X} stk_r1=0x{:08X} stk_r2=0x{:08X} stk_r3=0x{:08X} stk_r12=0x{:08X}\r\n\
+             xPSR: T={} EXC={} STKALIGN={}\r\n",
+            psp, stk_pc, stk_lr, stk_xpsr, stk_r0, stk_r1, stk_r2, stk_r3, stk_r12,
+            xpsr_t, xpsr_exc, xpsr_stk,
+        );
+        // Dump stack memory from PSP-32 to PSP+64 (24 words) to find the real frame.
+        // If PSP is wrong, a valid frame [r0,r1,r2,r3,r12,lr,PC,xPSR] should be
+        // visible nearby: look for xPSR with T-bit=1 and EXC=0 at offset +28.
+        let _ = write!(uart, "Stack dump (PSP-0x20 to PSP+0x40):\r\n");
+        let base = psp.saturating_sub(0x20);
+        let base = base & !3u32; // word-align
+        let mut addr = base;
+        while addr < psp.saturating_add(0x40) {
+            let val = unsafe { (addr as *const u32).read_volatile() };
+            let marker = if addr == psp { "<PSP" } else { "" };
+            let _ = write!(uart, "  [0x{:08X}] 0x{:08X} {}\r\n", addr, val, marker);
+            addr = addr.wrapping_add(4);
+        }
+    }
+
+    let _ = write!(uart, "!!! HALTED !!!\r\n");
+
     loop {}
 }
