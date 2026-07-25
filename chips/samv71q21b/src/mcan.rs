@@ -649,8 +649,24 @@ impl Mcan {
         self.regs.ils.set(0);
         self.regs.ile.write(ILE::EINT0::SET);
 
-        // Enable TX buffer transmission interrupt for all buffers
+        // Per-buffer TX interrupt enables.
+        //
+        // IR::TC and IR::TCF are each gated by a *per-buffer* enable register;
+        // IE::TCE / IE::TCFE above only route an already-set flag to the
+        // interrupt line, they do not cause the flag to be set. So both of
+        // these are required, not just TXBTIE:
+        //
+        //   TXBTIE -> IR::TC   (transmission completed successfully)
+        //   TXBCIE -> IR::TCF  (transmission cancelled / abandoned)
+        //
+        // TXBCIE matters because with CCCR.DAR = 1 the M_CAN abandons a frame
+        // after a single failed attempt -- including a lost arbitration, which
+        // is not a protocol error and so raises neither PEA nor PED. It clears
+        // TXBRP and sets TXBCF. Without TXBCIE that produces no interrupt at
+        // all, the transmit client is never called back, and the caller just
+        // blocks until its own timeout expires.
         self.regs.txbtie.set((1u32 << TX_BUF_COUNT) - 1);
+        self.regs.txbcie.set((1u32 << TX_BUF_COUNT) - 1);
 
         self.leave_config_mode()?;
 
@@ -811,7 +827,12 @@ impl Mcan {
             self.handle_tx_complete();
         }
 
-        // TX Cancellation Finished (frame dropped — no ACK with DAR=1)
+        // TX Cancellation Finished: the frame was abandoned rather than sent.
+        // Reached either via a software cancellation (TXBCR) or, when
+        // CCCR.DAR = 1, after a single failed transmission attempt -- most
+        // often a lost arbitration, which raises no protocol error. Requires
+        // TXBCIE to be set in hw_enable(), otherwise IR::TCF never sets and
+        // the failure is silent.
         if ir.is_set(IR::TCF) {
             self.regs.ir.write(IR::TCF::SET);
             self.transmit_client.map(|client| {
