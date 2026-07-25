@@ -321,6 +321,26 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     // CAN (MCAN1 @ 500 kbps via ATA6561 transceiver)
     // -----------------------------------------------------------------------
+    // Enable automatic retransmission (CCCR.DAR = 0).
+    //
+    // The driver defaults this off, matching the rest of Tock, and the CAN
+    // syscall interface exposes no command to change it -- so it has to be set
+    // here, before the app calls enable. It must also happen while the
+    // peripheral is still Disabled, which is the case during board setup.
+    //
+    // This board is an OBD-II scanner: it transmits diagnostic requests at
+    // 0x18DB33F1, a 29-bit ID whose base ID (0x636) sits near the bottom of the
+    // priority order, onto a vehicle bus carrying continuous higher-priority
+    // broadcast traffic. Losing arbitration is routine and is not an error --
+    // the CAN-designed response is to retry until the bus is free. With
+    // DAR = 1 the controller instead abandons the frame after one attempt, so
+    // a request is simply dropped whenever it collides with other traffic.
+    use kernel::hil::can::Configure;
+    peripherals
+        .mcan1
+        .set_automatic_retransmission(true)
+        .expect("MCAN1 must be Disabled during board setup");
+
     let can = components::can::CanComponent::new(
         board_kernel,
         capsules_extra::can::DRIVER_NUM,
