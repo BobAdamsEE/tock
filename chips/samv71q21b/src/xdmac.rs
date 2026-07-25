@@ -20,7 +20,9 @@ const XDMAC_BASE: usize = 0x4007_8000;
 pub const XDMAC_PID: u32 = 58;
 
 // Global register offsets
+#[allow(dead_code)] // part of the XDMAC register map; not yet used
 const GIE: usize = 0x0C;
+#[allow(dead_code)] // part of the XDMAC register map; not yet used
 const GID: usize = 0x10;
 const GIS: usize = 0x18;
 const GE: usize = 0x1C;
@@ -28,7 +30,9 @@ const GD: usize = 0x20;
 const GS: usize = 0x24;
 
 // Per-channel register offsets (base = XDMAC_BASE + 0x50 + ch * 0x40)
+#[allow(dead_code)] // part of the XDMAC register map; not yet used
 const CIE: usize = 0x00;
+#[allow(dead_code)] // part of the XDMAC register map; not yet used
 const CID: usize = 0x04;
 const CIS: usize = 0x0C;
 const CSA: usize = 0x10;

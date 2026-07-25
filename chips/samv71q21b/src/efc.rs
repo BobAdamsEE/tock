@@ -107,11 +107,6 @@ const EPA_PAGE_ALIGN: u32 = 16;
 /// ROM IAP function pointer address (NMI vector in ROM).
 const IAP_ENTRY_ADDR: usize = 0x0080_0008;
 
-// MPU registers
-const MPU_CTRL: *mut u32 = 0xE000_ED94 as *mut u32;
-const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
-const MPU_RASR: *mut u32 = 0xE000_EDA0 as *mut u32;
-
 // ---------------------------------------------------------------------------
 // Page buffer type
 // ---------------------------------------------------------------------------
@@ -175,6 +170,11 @@ impl Efc {
     pub fn handle_interrupt(&self) {}
 
     /// Issue an EFC command via the ROM IAP function. Returns FSR.
+    ///
+    /// Must run from SRAM — the IAP call triggers a flash operation (erase
+    /// or write); fetching instructions from flash during that operation
+    /// causes a read-while-write bus fault.
+    #[link_section = ".ramfunc"]
     fn call_iap(cmd: u32, arg: u32) -> u32 {
         let fcr = (FKEY << 24) | ((arg & 0xFFFF) << 8) | (cmd & 0xFF);
         let iap_ptr = unsafe { core::ptr::read_volatile(IAP_ENTRY_ADDR as *const u32) };
@@ -182,7 +182,8 @@ impl Efc {
         iap(0, fcr)
     }
 
-    /// Erase the 32-page block containing `page_number` via EPA + IAP.
+    /// Erase the 16-page block containing `page_number` via EPA + IAP.
+    #[link_section = ".ramfunc"]
     fn erase_block(page_number: usize) -> u32 {
         let first_page = (page_number as u32) & !(EPA_PAGE_ALIGN - 1);
         let epa_arg = first_page | EPA_ERASE_SIZE;

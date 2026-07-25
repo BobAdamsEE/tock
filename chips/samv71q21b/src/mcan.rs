@@ -472,29 +472,58 @@ impl Mcan {
         (word_index * 4) as u32
     }
 
+    // True if the Cortex-M7 D-Cache is currently enabled (SCB CCR bit 16).
+    // Writing to DCCMVAC / DCIMVAC when the cache is disabled is CONSTRAINED
+    // UNPREDICTABLE and can generate IMPRECISERR.  When the cache is off the
+    // CPU and MCAN DMA both hit SRAM directly — no coherency maintenance is
+    // needed at all.
+    fn is_dcache_enabled() -> bool {
+        unsafe { core::ptr::read_volatile(0xE000_ED14 as *const u32) & (1 << 16) != 0 }
+    }
+
     // Cortex-M7 D-Cache: clean (flush dirty lines to SRAM).
     fn dcache_clean(addr: usize, len: usize) {
+        if !Self::is_dcache_enabled() {
+            // Cache is off: writes go straight to SRAM, no flush needed.
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)); }
+            return;
+        }
         const DCCMVAC: *mut u32 = 0xE000_EF68 as *mut u32;
+        // Mask interrupts for the DCCMVAC → DSB window.  An interrupt (e.g.
+        // ECC_WARNING) firing between DCCMVAC writes and the final DSB causes
+        // exception entry to drain the AXI write buffer while cache write-backs
+        // are still in flight; that drain can fail with IMPRECISERR.  PRIMASK
+        // prevents preemption until the DSB confirms all write-backs landed.
         unsafe {
+            core::arch::asm!("cpsid i", options(nostack, preserves_flags));
             let mut a = addr & !(CACHE_LINE - 1);
             while a < addr + len {
                 core::ptr::write_volatile(DCCMVAC, a as u32);
                 a += CACHE_LINE;
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            core::arch::asm!("cpsie i", options(nostack, preserves_flags));
         }
     }
 
     // Cortex-M7 D-Cache: invalidate (discard cached copies).
     fn dcache_invalidate(addr: usize, len: usize) {
+        if !Self::is_dcache_enabled() {
+            // Cache is off: MCAN DMA writes go straight to SRAM, CPU reads
+            // come straight from SRAM — no invalidation needed.
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)); }
+            return;
+        }
         const DCIMVAC: *mut u32 = 0xE000_EF5C as *mut u32;
         unsafe {
+            core::arch::asm!("cpsid i", options(nostack, preserves_flags));
             let mut a = addr & !(CACHE_LINE - 1);
             while a < addr + len {
                 core::ptr::write_volatile(DCIMVAC, a as u32);
                 a += CACHE_LINE;
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            core::arch::asm!("cpsie i", options(nostack, preserves_flags));
         }
     }
 
@@ -521,6 +550,21 @@ impl Mcan {
     /// Full hardware enable sequence: config mode → set timing/mode →
     /// set up message RAM → leave config mode.
     fn hw_enable(&self) -> Result<(), ErrorCode> {
+        // Disable the Cortex-M7 default write buffer so any imprecise bus
+        // fault becomes precise: the exact faulting PC and BFAR are captured
+        // instead of a deferred IMPRECISERR with no address.  Leave this in
+        // until the CAN bring-up is stable; it slightly reduces store
+        // throughput but is invaluable for diagnosing cache/DMA coherence
+        // bugs.  Clear bit 1 of ACTLR (0xE000_E008) to re-enable the buffer.
+        unsafe {
+            const ACTLR: *mut u32 = 0xE000_E008 as *mut u32;
+            let v = core::ptr::read_volatile(ACTLR);
+            core::ptr::write_volatile(ACTLR, v | (1 << 1)); // DISDEFWBUF
+            // DSB+ISB required after ACTLR write: without ISB the pipeline
+            // may not see the new setting before the next instruction executes.
+            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+        }
+
         self.enter_config_mode()?;
 
         let timing = self.bit_timing.get().ok_or(ErrorCode::INVAL)?;
@@ -567,22 +611,38 @@ impl Mcan {
         // Configure message RAM pointers
         self.setup_message_ram();
 
-        // Global filter: accept all non-matching frames into FIFO 0
+        // Global filter: reject non-matching standard frames (the STD filter
+        // list in setup_message_ram holds the OBD-II range 0x700–0x7FF).
+        // Accept non-matching extended frames into FIFO 0 so that 29-bit
+        // OBD-II (ISO 15765-4 extended) responses are not silently dropped.
         self.regs.gfc.write(
-            GFC::ANFS.val(0) // Accept non-matching std into FIFO 0
-                + GFC::ANFE.val(0) // Accept non-matching ext into FIFO 0
+            GFC::ANFS.val(2) // Reject non-matching standard frames
+                + GFC::ANFE.val(0) // Accept non-matching extended into FIFO 0
                 + GFC::RRFS::CLEAR
                 + GFC::RRFE::CLEAR,
         );
 
-        // Enable interrupts: TX complete, RX FIFO 0 new.
-        // Error interrupts (BOE/EPE/EWE/PEAE/PEDE) are disabled to
-        // prevent interrupt storms on noisy buses from starving the
-        // app scheduler.  Errors are still visible via PSR polling.
+        // Enable TX/error interrupts only.  RF0NE/RF0LE (RX FIFO 0) are
+        // intentionally omitted here: the MCAN controller goes live on the
+        // bus as soon as INIT is cleared, so frames from other nodes arrive
+        // immediately — before the app calls CMD_START_RECEIVE and registers
+        // a receive buffer.  Enabling RF0NE here would fire handle_rx_fifo0()
+        // into an unregistered capsule buffer, causing a write to an invalid
+        // address through the write buffer → imprecise bus error → HardFault.
+        // RF0NE/RF0LE are enabled in start_receive_process() and disabled in
+        // stop_receive() / hw_disable().
+        //
+        // PEAE fires on ACK errors with DAR=1 (no auto-retransmit): the
+        // M_CAN clears TXBRP after one failed attempt but fires neither TC
+        // nor TCF.  PEAE is the only way to detect the failed TX and
+        // unblock the app's yield_for.  TCFE is kept for software-requested
+        // cancellations via TXBCR.
+        // BOE/EPE/EWE are NOT enabled — bus error state changes are handled
+        // inside handle_interrupt whenever TC or PEAE brings us in.
         self.regs.ie.write(
             IE::TCE::SET
-                + IE::RF0NE::SET
-                + IE::RF0LE::SET,
+                + IE::TCFE::SET
+                + IE::PEAE::SET,
         );
 
         // All interrupts → line 0
@@ -632,12 +692,26 @@ impl Mcan {
         self.regs.rxesc.set(0);
         self.regs.txesc.set(0);
 
-        // Zero out the message RAM
+        // Zero out the message RAM and immediately flush to physical SRAM.
+        // Without the dcache_clean, the D-Cache holds dirty zero-lines over
+        // every RX FIFO element.  Later, when handle_rx_fifo0() calls
+        // DCIMVAC on one of those elements, Cortex-M7 triggers an internal
+        // write-back for the dirty line before discarding it; that write-back
+        // drains through the write buffer after the ISR returns to Thread mode
+        // and faults as IMPRECISERR → HardFault.  Cleaning here eliminates
+        // all dirty lines before MCAN DMA starts, so DCIMVAC only ever sees
+        // clean lines (simple invalidation, no write-back required).
         self.msg_ram.map(|ram| {
             for w in ram.words.iter_mut() {
                 *w = 0;
             }
+            // Standard ID range filter: accept 0x700–0x7FF (full OBD-II address
+            // space) into RX FIFO 0; GFC rejects everything else.
+            // Bits[31:30]=SFT=0(range), [29:27]=SFEC=1(FIFO0),
+            // [26:16]=SFID1=0x700, [10:0]=SFID2=0x7FF
+            ram.words[STD_FILTER_OFFSET] = 0x0F00_07FF;
         });
+        Self::dcache_clean(self.msg_ram_base.get() as usize, MSG_RAM_WORDS * 4);
     }
 
     fn hw_disable(&self) {
@@ -709,7 +783,6 @@ impl Mcan {
             }
             ram.words[elem_base + 2] = d0;
             ram.words[elem_base + 3] = d1;
-
         });
 
         // Clean D-Cache for the TX element so the MCAN DMA reads
@@ -736,6 +809,16 @@ impl Mcan {
         if ir.is_set(IR::TC) {
             self.regs.ir.write(IR::TC::SET);
             self.handle_tx_complete();
+        }
+
+        // TX Cancellation Finished (frame dropped — no ACK with DAR=1)
+        if ir.is_set(IR::TCF) {
+            self.regs.ir.write(IR::TCF::SET);
+            self.transmit_client.map(|client| {
+                if let Some(buf) = self.tx_buffer.take() {
+                    client.transmit_complete(Err(can::Error::SetBySoftware), buf);
+                }
+            });
         }
 
         // RX FIFO 0 new message
@@ -777,6 +860,9 @@ impl Mcan {
         }
 
         // Protocol error (arbitration / data phase)
+        // PEAE is enabled so that ACK errors with DAR=1 reach us: the M_CAN
+        // clears TXBRP after one failed attempt without setting TC or TCF,
+        // so this is the only interrupt that fires for a no-ACK TX.
         if ir.is_set(IR::PEA) || ir.is_set(IR::PED) {
             self.regs.ir.write(IR::PEA::SET + IR::PED::SET);
             let lec = self.regs.psr.read(PSR::LEC);
@@ -790,6 +876,14 @@ impl Mcan {
                 _ => can::Error::SetBySoftware,
             };
             self.state.set(McanState::Error(err));
+            // Unblock any pending TX: DAR=1 already cleared TXBRP so there
+            // will be no TC interrupt.  Return the buffer now so the app's
+            // yield_for can complete.
+            self.transmit_client.map(|client| {
+                if let Some(buf) = self.tx_buffer.take() {
+                    client.transmit_complete(Err(err), buf);
+                }
+            });
         }
     }
 
@@ -815,17 +909,19 @@ impl Mcan {
 
         let get_idx = f0s.read(RXF0S::F0GI) as usize;
         let elem_base = RX_FIFO0_OFFSET + get_idx * CAN_ELEMENT_WORDS;
+        let inv_addr = self.msg_ram_base.get() as usize + elem_base * 4;
+
+        // Invalidate D-Cache for the RX element so the CPU reads
+        // fresh data written by the MCAN DMA, not stale cache lines.
+        // Precondition: setup_message_ram() must have called dcache_clean
+        // after zeroing so no dirty lines exist here (dirty lines + DCIMVAC
+        // triggers an internal write-back through the write buffer that can
+        // fault as IMPRECISERR when it drains after ISR return).
+        Self::dcache_invalidate(inv_addr, CAN_ELEMENT_WORDS * 4);
 
         let mut frame_id = can::Id::Standard(0);
         let mut frame_data = [0u8; can::STANDARD_CAN_PACKET_SIZE];
         let mut frame_len: usize = 0;
-
-        // Invalidate D-Cache for the RX element so the CPU reads
-        // fresh data written by the MCAN DMA, not stale cache lines.
-        Self::dcache_invalidate(
-            self.msg_ram_base.get() as usize + elem_base * 4,
-            CAN_ELEMENT_WORDS * 4,
-        );
 
         self.msg_ram.map(|ram| {
             let w0 = ram.words[elem_base];
@@ -1115,7 +1211,11 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Mcan {
         match self.state.get() {
             McanState::Running | McanState::Error(_) => {
                 self.rx_buffer.put(Some(buffer));
-                // RX FIFO 0 new message interrupt is already enabled in hw_enable
+                // Enable FIFO 0 interrupts now that a buffer is registered.
+                // Any frames that arrived between hw_enable() and here will
+                // have set IR::RF0N already; enabling RF0NE causes an
+                // immediate interrupt that drains the accumulated frames.
+                self.regs.ie.modify(IE::RF0NE::SET + IE::RF0LE::SET);
                 Ok(())
             }
             McanState::Disabled => Err((ErrorCode::OFF, buffer)),
@@ -1131,6 +1231,9 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Mcan {
                 if self.rx_buffer.is_none() {
                     return Err(ErrorCode::ALREADY);
                 }
+                // Disable FIFO 0 interrupts before returning the buffer so
+                // no in-flight RF0N can race with the deferred callback.
+                self.regs.ie.modify(IE::RF0NE::CLEAR + IE::RF0LE::CLEAR);
                 self.deferred_action.set(AsyncAction::AbortReceive);
                 self.deferred_call.set();
                 Ok(())

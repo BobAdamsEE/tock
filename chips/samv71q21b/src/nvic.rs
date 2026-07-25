@@ -71,8 +71,8 @@ pub const PWM1: u32 = 60;
 // 61 ARM (FPU)
 // 62 reserved
 pub const RSWDT: u32 = 63;
-// 64 ARM ECC WARNING
-// 65 ARM ECC FAULT
+pub const ECC_WARNING: u32 = 64; // Cortex-M7 correctable ECC error
+pub const ECC_FAULT: u32 = 65;   // Cortex-M7 uncorrectable ECC error
 pub const GMAC_Q1: u32 = 66;
 pub const GMAC_Q2: u32 = 67;
 // 68 ARM IXC
