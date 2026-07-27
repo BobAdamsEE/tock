@@ -23,6 +23,9 @@ use capsules_system::scheduler::round_robin::RoundRobinSched;
 
 use samv71q21b::chip::{Atsamv71q21b, Atsamv71q21bDefaultPeripherals};
 use samv71q21b::gpio::PeripheralFunction;
+mod bl_reboot;
+mod credentials;
+
 use samv71q21b::mcan;
 use samv71q21b::pmc;
 use samv71q21b::twihs;
@@ -30,6 +33,12 @@ use samv71q21b::twihs;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// Package name of the one application permitted to reboot the board into the
+/// bootloader. Trusting the name is sound here because it is only consulted
+/// for an application whose signature was accepted, and the signature covers
+/// the header the name lives in.
+const PRIVILEGED_APP_NAME: &str = "uds";
 
 const NUM_PROCS: u8 = 4;
 const NUM_PROCS_USIZE: usize = NUM_PROCS as usize;
@@ -63,8 +72,13 @@ struct SamV71Xult {
             samv71q21b::tc::Tc<'static>,
         >,
     >,
-    /// CAN driver (MCAN1 via ATA6561 transceiver).
-    can: &'static capsules_extra::can::CanCapsule<'static, mcan::Mcan>,
+    /// CAN driver (MCAN1 via ATA6561 transceiver), one client of the CAN mux.
+    can: &'static capsules_extra::can::CanCapsule<
+        'static,
+        capsules_core::virtualizers::virtual_can::CanDevice<'static, mcan::Mcan>,
+    >,
+    /// Reboot-into-bootloader driver, restricted to the signed UDS app.
+    bl_reboot: &'static bl_reboot::BootloaderReboot<'static>,
     /// Scheduler.
     scheduler: &'static RoundRobinSched<'static>,
     /// SysTick for preemptive scheduling.
@@ -81,6 +95,7 @@ impl SyscallDriverLookup for SamV71Xult {
             capsules_core::led::DRIVER_NUM => f(Some(self.led)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules_extra::can::DRIVER_NUM => f(Some(self.can)),
+            bl_reboot::DRIVER_NUM => f(Some(self.bl_reboot)),
             _ => f(None),
         }
     }
@@ -341,14 +356,62 @@ pub unsafe fn main() {
         .set_automatic_retransmission(true)
         .expect("MCAN1 must be Disabled during board setup");
 
+    // CAN virtualization.
+    //
+    // The syscall capsule is now one client of a MuxCan rather than the owner
+    // of the peripheral, so in-kernel clients -- a UDS server, for example --
+    // can be added later without displacing userspace.
+    let can_mux = components::can::CanMuxComponent::new(&peripherals.mcan1)
+        .finalize(components::can_mux_component_static!(mcan::Mcan));
+
+    let can_device = components::can::CanDeviceComponent::new(can_mux)
+        .finalize(components::can_device_component_static!(mcan::Mcan));
+
+    // Bus configuration.
+    //
+    // Bitrate, timing and operation mode describe the shared bus rather than
+    // any one process's use of it, so the CAN syscall driver no longer exposes
+    // them and they are set here instead. Processes now declare only which
+    // identifiers they want, via the subscribe commands.
+    peripherals
+        .mcan1
+        .set_bitrate(500_000)
+        .expect("MCAN1 bitrate 500 kbps");
+    peripherals
+        .mcan1
+        .set_operation_mode(kernel::hil::can::OperationMode::Normal)
+        .expect("MCAN1 normal mode");
+
     let can = components::can::CanComponent::new(
         board_kernel,
         capsules_extra::can::DRIVER_NUM,
-        &peripherals.mcan1,
+        can_device,
     )
-    .finalize(components::can_component_static!(mcan::Mcan));
+    .with_subscriber(can_device)
+    .finalize(components::can_component_static!(
+        capsules_core::virtualizers::virtual_can::CanDevice<'static, mcan::Mcan>
+    ));
 
     kernel::deferred_call::DeferredCallClient::register(&peripherals.mcan1);
+
+    // -----------------------------------------------------------------------
+    // Reboot-into-bootloader capsule
+    // -----------------------------------------------------------------------
+    // Only the process holding the identity below may use it. That identity is
+    // granted solely to an application whose ECDSA signature was accepted; see
+    // `credentials.rs`. Unsigned applications get `ShortId::LocallyUnique`,
+    // which compares unequal to everything, so the check fails closed.
+    let gpbr = static_init!(samv71q21b::gpbr::Gpbr, samv71q21b::gpbr::Gpbr::new());
+    let bl_reboot = static_init!(
+        bl_reboot::BootloaderReboot<'static>,
+        bl_reboot::BootloaderReboot::new(
+            gpbr,
+            core::num::NonZeroU32::new(credentials::SignedAppIdAssigner::name_id(
+                PRIVILEGED_APP_NAME
+            ))
+            .into(),
+        )
+    );
 
     // -----------------------------------------------------------------------
     // Scheduler
@@ -362,6 +425,7 @@ pub unsafe fn main() {
         led,
         alarm,
         can,
+        bl_reboot,
         scheduler,
         systick: cortexm7::systick::SysTick::new_with_calibration(300_000_000),
     };
@@ -380,24 +444,127 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    let process_management_capability =
-        create_capability!(capabilities::ProcessManagementCapability);
+    // -----------------------------------------------------------------------
+    // Credential checking
+    // -----------------------------------------------------------------------
+    // Applications are *not* required to be signed: `OptionalCredentials`
+    // reports `require_credentials() == false`, so unsigned applications such
+    // as `blink` load and run exactly as before. What a signature buys is a
+    // fixed identity, and the only thing that identity unlocks is the
+    // reboot-into-bootloader driver.
+    let sha = components::sha::ShaSoftware256Component::new()
+        .finalize(components::sha_software_256_component_static!());
 
-    kernel::process::load_processes(
+    // Public half of keys/uds-signing-priv.pem. Sign an application with:
+    //   tockloader tbf credential add ecdsap256 \
+    //       --private-key keys/uds-signing-priv.pem <app.tab>
+    let verifying_key = static_init!(
+        [u8; 64],
+        [
+            0xb9, 0xe2, 0x2e, 0xf0, 0x5f, 0xea, 0xfc, 0xaa,
+            0x4b, 0xa5, 0x9b, 0x66, 0xae, 0x93, 0xab, 0x64,
+            0x19, 0x63, 0x98, 0x8b, 0x47, 0xe8, 0xb9, 0x66,
+            0xad, 0x2d, 0x8c, 0xf3, 0x64, 0xd0, 0x12, 0x61,
+            0x39, 0x0f, 0x32, 0x83, 0xaa, 0x01, 0x58, 0xf3,
+            0xd5, 0x77, 0x8b, 0xe0, 0x8a, 0x62, 0x96, 0xe2,
+            0x74, 0xe3, 0x12, 0x6b, 0x8c, 0x15, 0x53, 0x9a,
+            0x3a, 0x2a, 0x08, 0x38, 0x43, 0x96, 0x5c, 0x53,
+        ]
+    );
+    let verifying_keys = static_init!([&'static mut [u8; 64]; 1], [verifying_key]);
+
+    let ecdsa_scratch = static_init!([u8; 64], [0; 64]);
+    let ecdsa_verifier = static_init!(
+        ecdsa_sw::p256_verifier::EcdsaP256SignatureVerifier<'static>,
+        ecdsa_sw::p256_verifier::EcdsaP256SignatureVerifier::new(ecdsa_scratch)
+    );
+    kernel::deferred_call::DeferredCallClient::register(ecdsa_verifier);
+
+    let verifier_keys =
+        components::signature_verify_in_memory_keys::SignatureVerifyInMemoryKeysComponent::new(
+            ecdsa_verifier,
+            verifying_keys,
+        )
+        .finalize(
+            components::signature_verify_in_memory_keys_component_static!(
+                ecdsa_sw::p256_verifier::EcdsaP256SignatureVerifier<'static>,
+                1,
+                64,
+                32,
+                64,
+            ),
+        );
+
+    let signature_policy = components::appid::checker_signature::AppCheckerSignatureComponent::new(
+        sha,
+        verifier_keys,
+        tock_tbf::types::TbfFooterV2CredentialsType::EcdsaNistP256,
+    )
+    .finalize(components::app_checker_signature_component_static!(
+        capsules_extra::signature_verify_in_memory_keys::SignatureVerifyInMemoryKeys<
+            'static,
+            ecdsa_sw::p256_verifier::EcdsaP256SignatureVerifier<'static>,
+            1,
+            64,
+            32,
+            64,
+        >,
+        capsules_extra::sha256::Sha256Software<'static>,
+        32,
+        64,
+    ));
+
+    // Make a missing credential non-fatal while keeping signature checking
+    // itself unchanged.
+    let checking_policy = static_init!(
+        credentials::OptionalCredentials<'static>,
+        credentials::OptionalCredentials::new(signature_policy)
+    );
+    checking_policy.setup();
+
+    let assigner = static_init!(
+        credentials::SignedAppIdAssigner,
+        credentials::SignedAppIdAssigner::new()
+    );
+
+    let checker = components::appid::checker::ProcessCheckerMachineComponent::new(checking_policy)
+        .finalize(components::process_checker_machine_component_static!());
+
+    let storage_permissions_policy =
+        components::storage_permissions::null::StoragePermissionsNullComponent::new().finalize(
+            components::storage_permissions_null_component_static!(
+                Atsamv71q21b<Atsamv71q21bDefaultPeripherals>,
+                kernel::process::ProcessStandardDebugFull,
+            ),
+        );
+
+    static FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
+        capsules_system::process_policies::PanicFaultPolicy {};
+
+    let app_flash = core::slice::from_raw_parts(
+        addr_of!(_sapps),
+        addr_of!(_eapps) as usize - addr_of!(_sapps) as usize,
+    );
+    let app_memory = core::slice::from_raw_parts_mut(
+        addr_of_mut!(_sappmem),
+        addr_of!(_eappmem) as usize - addr_of!(_sappmem) as usize,
+    );
+
+    let _loader = components::loader::sequential::ProcessLoaderSequentialComponent::new(
+        checker,
         board_kernel,
         chip,
-        core::slice::from_raw_parts(
-            addr_of!(_sapps),
-            addr_of!(_eapps) as usize - addr_of!(_sapps) as usize,
-        ),
-        core::slice::from_raw_parts_mut(
-            addr_of_mut!(_sappmem),
-            addr_of!(_eappmem) as usize - addr_of!(_sappmem) as usize,
-        ),
-        &capsules_system::process_policies::PanicFaultPolicy {},
-        &process_management_capability,
+        &FAULT_RESPONSE,
+        assigner,
+        storage_permissions_policy,
+        app_flash,
+        app_memory,
     )
-    .unwrap_or_else(|_err| {});
+    .finalize(components::process_loader_sequential_component_static!(
+        Atsamv71q21b<Atsamv71q21bDefaultPeripherals>,
+        kernel::process::ProcessStandardDebugFull,
+        NUM_PROCS_USIZE
+    ));
 
     let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
 

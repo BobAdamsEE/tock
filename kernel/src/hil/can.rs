@@ -168,6 +168,22 @@ pub struct FilterParameters {
 
     /// The receive FIFO Id that the filter will be applied to
     pub fifo_number: usize,
+
+    /// The identifier that this filter matches against.
+    ///
+    /// The variant additionally selects which list of filter elements the
+    /// filter is installed into on peripherals that keep standard and
+    /// extended filters separately (e.g. Bosch M_CAN).
+    pub id: Id,
+
+    /// The mask applied to both the received and the configured identifier
+    /// before they are compared. A frame matches when
+    /// `(received_id & mask) == (id & mask)`.
+    ///
+    /// An all-ones mask therefore selects a single identifier, and a zero
+    /// mask accepts every identifier. Ignored when `identifier_mode` is
+    /// [`IdentifierMode::List`], which always matches `id` exactly.
+    pub mask: u32,
 }
 
 /// This structure defines the parameters for the timing mode

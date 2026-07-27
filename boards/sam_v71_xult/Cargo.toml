@@ -13,6 +13,8 @@ samv71q21b = { path = "../../chips/samv71q21b" }
 capsules-core = { path = "../../capsules/core" }
 capsules-extra = { path = "../../capsules/extra" }
 capsules-system = { path = "../../capsules/system" }
+ecdsa-sw = { path = "../../capsules/ecdsa_sw" }
+tock-tbf = { path = "../../libraries/tock-tbf" }
 
 [build-dependencies]
 tock_build_scripts = { path = "../build_scripts" }
