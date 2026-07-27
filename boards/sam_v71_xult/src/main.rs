@@ -568,6 +568,17 @@ pub unsafe fn main() {
 
     let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
 
+    // Tell the bootloader this kernel is healthy, by clearing the boot-attempt
+    // counter it incremented on the way out. Everything above has succeeded --
+    // clocks, peripherals, process loading -- so if we fault after this it is
+    // not a kernel that cannot start.
+    //
+    // GPBR6, mirroring BOOT_ATTEMPT_INDEX in the bootloader's
+    // `bootloader_entry_gpbr.rs`. Written directly rather than through a
+    // shared constant because the two live in separate builds; the bootloader
+    // side documents the pairing.
+    gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr6, 0);
+
     board_kernel.kernel_loop(
         &platform,
         chip,
