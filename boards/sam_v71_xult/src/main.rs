@@ -56,6 +56,14 @@ static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> =
 
 /// Board platform struct.
 struct SamV71Xult {
+    /// Watchdog, armed by the bootloader.
+    ///
+    /// The kernel does not choose whether it runs -- WDT_MR is write-once and
+    /// the bootloader already wrote it -- it only keeps it fed from the main
+    /// loop. A kernel that stops reaching the loop stops petting, the chip
+    /// resets, and the bootloader's boot-attempt counter advances; three of
+    /// those and the board stays in the bootloader.
+    watchdog: &'static samv71q21b::wdt::Wdt,
     /// Console driver.
     console: &'static capsules_core::console::Console<'static>,
     /// LED driver (LED0=PA23, LED1=PC9).
@@ -107,7 +115,7 @@ impl KernelResources<Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> for SamV71Xul
     type ProcessFault = ();
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm7::systick::SysTick;
-    type WatchDog = ();
+    type WatchDog = samv71q21b::wdt::Wdt;
     type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup { self }
@@ -115,7 +123,7 @@ impl KernelResources<Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> for SamV71Xul
     fn process_fault(&self) -> &Self::ProcessFault { &() }
     fn scheduler(&self) -> &Self::Scheduler { self.scheduler }
     fn scheduler_timer(&self) -> &Self::SchedulerTimer { &self.systick }
-    fn watchdog(&self) -> &Self::WatchDog { &() }
+    fn watchdog(&self) -> &Self::WatchDog { self.watchdog }
     fn context_switch_callback(&self) -> &Self::ContextSwitchCallback { &() }
 }
 
@@ -160,8 +168,10 @@ impl capsules_extra::at24mac402::At24Mac402Client for EepromDebugClient {
 /// Main kernel entry point.
 #[no_mangle]
 pub unsafe fn main() {
-    // Disable watchdog (write-once register).
-    core::ptr::write_volatile(0x400E_1854 as *mut u32, 0x0000_8000);
+    // The watchdog is deliberately *not* touched here. WDT_MR is write-once
+    // and the bootloader has already written it, so this used to be a silent
+    // no-op that read as if the kernel were in control of it. Petting happens
+    // through the WatchDog trait from the kernel's main loop instead.
 
     // Early PMC enables: PIOA(10), PIOB(11), PIOC(12), USART1(14), TC0_CH0(23).
     core::ptr::write_volatile(
@@ -420,7 +430,10 @@ pub unsafe fn main() {
         components::sched::round_robin::RoundRobinComponent::new(processes)
             .finalize(components::round_robin_component_static!(NUM_PROCS_USIZE));
 
+    let watchdog = static_init!(samv71q21b::wdt::Wdt, samv71q21b::wdt::Wdt::new());
+
     let platform = SamV71Xult {
+        watchdog,
         console,
         led,
         alarm,

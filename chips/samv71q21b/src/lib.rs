@@ -19,6 +19,7 @@ pub mod pmc;
 pub mod tc;
 pub mod twihs;
 pub mod uart;
+pub mod wdt;
 pub mod xdmac;
 
 // Peripherals
