@@ -1358,6 +1358,10 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Can<'_> {
                         scale_bits: can::ScaleBits::Bits32,
                         identifier_mode: can::IdentifierMode::Mask,
                         fifo_number: 0,
+                        // A zero mask accepts every identifier, matching the
+                        // all-zero filter registers `config_filter` writes.
+                        id: can::Id::Standard(0),
+                        mask: 0,
                     },
                     true,
                 );
@@ -1367,6 +1371,10 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Can<'_> {
                         scale_bits: can::ScaleBits::Bits32,
                         identifier_mode: can::IdentifierMode::Mask,
                         fifo_number: 1,
+                        // A zero mask accepts every identifier, matching the
+                        // all-zero filter registers `config_filter` writes.
+                        id: can::Id::Standard(0),
+                        mask: 0,
                     },
                     true,
                 );
@@ -1390,6 +1398,10 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Can<'_> {
                         scale_bits: can::ScaleBits::Bits32,
                         identifier_mode: can::IdentifierMode::Mask,
                         fifo_number: 0,
+                        // A zero mask accepts every identifier, matching the
+                        // all-zero filter registers `config_filter` writes.
+                        id: can::Id::Standard(0),
+                        mask: 0,
                     },
                     false,
                 );
@@ -1399,6 +1411,10 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Can<'_> {
                         scale_bits: can::ScaleBits::Bits32,
                         identifier_mode: can::IdentifierMode::Mask,
                         fifo_number: 1,
+                        // A zero mask accepts every identifier, matching the
+                        // all-zero filter registers `config_filter` writes.
+                        id: can::Id::Standard(0),
+                        mask: 0,
                     },
                     false,
                 );

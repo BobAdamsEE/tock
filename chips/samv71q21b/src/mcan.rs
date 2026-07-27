@@ -75,13 +75,32 @@ const CAN_CLK_HZ: u32 = 20_000_000;
 
 const STD_FILTER_COUNT: usize = 4;
 const EXT_FILTER_COUNT: usize = 4;
-const RX_FIFO0_COUNT: usize = 8;
+// At 500 kbit/s a consecutive frame arrives roughly every 260 us. Eight
+// elements is only ~2 ms of headroom, which is not enough to cover a flash
+// write or a slow client callback once several clients share the peripheral.
+const RX_FIFO0_COUNT: usize = 32;
 const TX_BUF_COUNT: usize = 4;
 
 // Classic CAN element: 2 header words + 2 data words = 16 bytes
 const CAN_ELEMENT_WORDS: usize = 4;
 const STD_FILTER_WORDS: usize = STD_FILTER_COUNT; // 1 word each
 const EXT_FILTER_WORDS: usize = EXT_FILTER_COUNT * 2; // 2 words each
+const FILTER_WORDS: usize = STD_FILTER_WORDS + EXT_FILTER_WORDS;
+
+// Filter element encodings (SAMV71 datasheet, "Standard/Extended Message ID
+// Filter Element"). Only the classic "identifier + mask" filter type is used.
+//
+//   standard, 1 word:  [31:30] SFT | [29:27] SFEC | [26:16] SFID1 | [10:0] SFID2
+//   extended, 2 words: w0 = [31:29] EFEC | [28:0] EFID1
+//                      w1 = [31:30] EFT  | [28:0] EFID2
+//
+// SFID1/EFID1 hold the identifier and SFID2/EFID2 hold the mask.
+const FILTER_TYPE_CLASSIC: u32 = 0b10; // SFT / EFT: identifier + mask
+const FILTER_CONFIG_FIFO0: u32 = 0b001; // SFEC / EFEC: store in RX FIFO 0
+const FILTER_CONFIG_DISABLED: u32 = 0b000; // SFEC / EFEC: element disabled
+
+const STD_ID_MASK: u32 = 0x7FF;
+const EXT_ID_MASK: u32 = 0x1FFF_FFFF;
 const RX_FIFO0_WORDS: usize = RX_FIFO0_COUNT * CAN_ELEMENT_WORDS;
 const TX_BUF_WORDS: usize = TX_BUF_COUNT * CAN_ELEMENT_WORDS;
 
@@ -358,6 +377,20 @@ impl From<McanState> for can::State {
     }
 }
 
+/// Does this error describe the controller, or just one frame that went wrong?
+///
+/// Bus-off, error-passive and error-warning are *states* the controller is in,
+/// reported by their own interrupts and cleared by their own recovery. The
+/// rest come from `PSR.LEC`, which records what went wrong with the last
+/// frame: they say nothing about whether the next one will succeed, and must
+/// not be left latched.
+fn is_controller_state(e: can::Error) -> bool {
+    matches!(
+        e,
+        can::Error::BusOff | can::Error::Passive | can::Error::Warning
+    )
+}
+
 #[derive(Clone, Copy)]
 enum AsyncAction {
     Enable,
@@ -412,6 +445,16 @@ pub struct Mcan {
     tx_buffer: TakeCell<'static, [u8; can::STANDARD_CAN_PACKET_SIZE]>,
     rx_buffer: TakeCell<'static, [u8; can::STANDARD_CAN_PACKET_SIZE]>,
 
+    /// Shadow copy of the filter elements, laid out exactly as the filter
+    /// region of message RAM.
+    ///
+    /// `setup_message_ram` zeroes all of message RAM (see the D-Cache note
+    /// there) and then re-applies this shadow, so filters installed while the
+    /// peripheral is disabled survive `enable()`. That in turn lets callers
+    /// configure filters in any order relative to `enable`, which the HIL
+    /// leaves unspecified.
+    filters: [Cell<u32>; FILTER_WORDS],
+
     deferred_call: DeferredCall,
     deferred_action: OptionalCell<AsyncAction>,
 }
@@ -433,6 +476,7 @@ impl Mcan {
             receive_client: OptionalCell::empty(),
             tx_buffer: TakeCell::empty(),
             rx_buffer: TakeCell::empty(),
+            filters: [const { Cell::new(0) }; FILTER_WORDS],
             deferred_call: DeferredCall::new(),
             deferred_action: OptionalCell::empty(),
         }
@@ -454,6 +498,7 @@ impl Mcan {
             receive_client: OptionalCell::empty(),
             tx_buffer: TakeCell::empty(),
             rx_buffer: TakeCell::empty(),
+            filters: [const { Cell::new(0) }; FILTER_WORDS],
             deferred_call: DeferredCall::new(),
             deferred_action: OptionalCell::empty(),
         }
@@ -611,13 +656,19 @@ impl Mcan {
         // Configure message RAM pointers
         self.setup_message_ram();
 
-        // Global filter: reject non-matching standard frames (the STD filter
-        // list in setup_message_ram holds the OBD-II range 0x700–0x7FF).
-        // Accept non-matching extended frames into FIFO 0 so that 29-bit
-        // OBD-II (ISO 15765-4 extended) responses are not silently dropped.
+        // Global filter: reject every frame that no filter element matched,
+        // standard and extended alike. Reception is therefore entirely
+        // determined by the filters installed through `hil::can::Filter`, and
+        // a peripheral with no filters receives nothing.
+        //
+        // ANFE used to be 0 (accept unmatched extended frames into FIFO 0),
+        // which meant 29-bit reception worked by accident: every extended
+        // frame on the bus was delivered and clients discarded the unwanted
+        // ones in software. That does not scale to several clients sharing the
+        // peripheral, and on a busy bus it spends an interrupt per frame.
         self.regs.gfc.write(
             GFC::ANFS.val(2) // Reject non-matching standard frames
-                + GFC::ANFE.val(0) // Accept non-matching extended into FIFO 0
+                + GFC::ANFE.val(2) // Reject non-matching extended frames
                 + GFC::RRFS::CLEAR
                 + GFC::RRFE::CLEAR,
         );
@@ -708,6 +759,13 @@ impl Mcan {
         self.regs.rxesc.set(0);
         self.regs.txesc.set(0);
 
+        // Extended ID AND Mask, applied to every received extended identifier
+        // before it is compared against the extended filter elements. All-ones
+        // makes it a no-op, which is what the classic identifier + mask
+        // filters written by `enable_filter` assume. This is the reset value,
+        // but `enable()` may run after a soft reset that left it modified.
+        self.regs.xidam.set(EXT_ID_MASK);
+
         // Zero out the message RAM and immediately flush to physical SRAM.
         // Without the dcache_clean, the D-Cache holds dirty zero-lines over
         // every RX FIFO element.  Later, when handle_rx_fifo0() calls
@@ -721,11 +779,14 @@ impl Mcan {
             for w in ram.words.iter_mut() {
                 *w = 0;
             }
-            // Standard ID range filter: accept 0x700–0x7FF (full OBD-II address
-            // space) into RX FIFO 0; GFC rejects everything else.
-            // Bits[31:30]=SFT=0(range), [29:27]=SFEC=1(FIFO0),
-            // [26:16]=SFID1=0x700, [10:0]=SFID2=0x7FF
-            ram.words[STD_FILTER_OFFSET] = 0x0F00_07FF;
+            // Re-apply the configured filter elements. The loop above disabled
+            // every one of them (SFEC/EFEC = 0), so any filter installed while
+            // the peripheral was disabled has to be written back here. The
+            // standard and extended filter lists are contiguous by
+            // construction, so one pass covers both.
+            for (i, filter) in self.filters.iter().enumerate() {
+                ram.words[STD_FILTER_OFFSET + i] = filter.get();
+            }
         });
         Self::dcache_clean(self.msg_ram_base.get() as usize, MSG_RAM_WORDS * 4);
     }
@@ -845,7 +906,30 @@ impl Mcan {
         // RX FIFO 0 new message
         if ir.is_set(IR::RF0N) {
             self.regs.ir.write(IR::RF0N::SET);
-            self.handle_rx_fifo0();
+
+            // Drain every queued element, not just one.
+            //
+            // RF0N latches when a message is written to the FIFO, so handling
+            // a single element per interrupt strands anything else already
+            // queued until the *next* frame happens to arrive. That went
+            // unnoticed while GFC accepted all unmatched extended frames,
+            // because bus traffic kept re-triggering the interrupt and
+            // flushing the backlog within microseconds. Now that the filters
+            // reject everything unwanted, a stranded element can sit in the
+            // FIFO indefinitely -- and back-to-back segmented traffic
+            // (ISO-TP consecutive frames arrive roughly every 260 us at
+            // 500 kbit/s) is exactly the case that queues several at once.
+            //
+            // RF0N is cleared *before* draining, so a frame arriving during
+            // the loop re-latches it and we get a fresh interrupt rather than
+            // losing it. The bound guarantees termination: the FIFO holds at
+            // most RX_FIFO0_COUNT elements, so anything still queued
+            // afterwards necessarily arrived after the clear above.
+            for _ in 0..RX_FIFO0_COUNT {
+                if !self.handle_rx_fifo0() {
+                    break;
+                }
+            }
         }
 
         // RX FIFO 0 message lost
@@ -909,23 +993,44 @@ impl Mcan {
     }
 
     fn handle_tx_complete(&self) {
-        let status = match self.state.get() {
-            McanState::Error(e) => Err(e),
-            _ => Ok(()),
-        };
+        // `IR::TC` is the controller saying *this* frame was transmitted and
+        // acknowledged. It succeeded, whatever went wrong before it.
+        //
+        // This used to report `self.state` instead, which is latched: one
+        // unacknowledged frame -- transmitting onto a bus with nothing else on
+        // it, which is the normal bench case -- left `Error(Ack)` set forever,
+        // and every later transmission was reported as failed even though it
+        // went out fine. With one application that is invisible, because the
+        // application that poisoned the state is the one that gives up. With
+        // two it is not: a second process inherits a transmit path that can
+        // never report success again, and `enable()` (which refuses in the
+        // error state) can never succeed again either.
+        //
+        // The latched protocol error is dropped here for the same reason. Real
+        // controller states are left alone: they have their own interrupts,
+        // and one good frame does not mean the controller has left them.
+        if let McanState::Error(e) = self.state.get() {
+            if !is_controller_state(e) {
+                self.state.set(McanState::Running);
+            }
+        }
 
         self.transmit_client.map(|client| {
             if let Some(buf) = self.tx_buffer.take() {
-                client.transmit_complete(status, buf);
+                client.transmit_complete(Ok(()), buf);
             }
         });
     }
 
-    fn handle_rx_fifo0(&self) {
+    /// Process a single element from RX FIFO 0.
+    ///
+    /// Returns `true` if an element was consumed, so the caller can keep
+    /// draining until the FIFO reports empty.
+    fn handle_rx_fifo0(&self) -> bool {
         let f0s = self.regs.rxf0s.extract();
         let fill = f0s.read(RXF0S::F0FL);
         if fill == 0 {
-            return;
+            return false;
         }
 
         let get_idx = f0s.read(RXF0S::F0GI) as usize;
@@ -978,6 +1083,8 @@ impl Mcan {
         self.receive_client.map(|client| {
             client.message_received(frame_id, &mut frame_data, frame_len, Ok(()));
         });
+
+        true
     }
 }
 
@@ -1261,5 +1368,134 @@ impl can::Receive<{ can::STANDARD_CAN_PACKET_SIZE }> for Mcan {
             }
             McanState::Disabled => Err(ErrorCode::OFF),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hil::can::Filter
+// ---------------------------------------------------------------------------
+
+impl Mcan {
+    /// Flush the filter region of message RAM out of the D-Cache so the MCAN's
+    /// AHB master sees the current filter elements.
+    fn clean_filter_region(&self) {
+        Self::dcache_clean(
+            self.msg_ram_base.get() as usize + Self::ram_byte_offset(STD_FILTER_OFFSET) as usize,
+            FILTER_WORDS * 4,
+        );
+    }
+
+    /// Install a standard (11-bit) filter element.
+    ///
+    /// A standard element is a single word, so the update is atomic from the
+    /// MCAN's point of view and needs no disable/re-enable sequence.
+    fn write_std_filter(&self, index: usize, word: u32) {
+        self.filters[index].set(word);
+        self.msg_ram.map(|ram| {
+            ram.words[STD_FILTER_OFFSET + index] = word;
+        });
+        self.clean_filter_region();
+    }
+
+    /// Install an extended (29-bit) filter element.
+    ///
+    /// An extended element spans two words and the MCAN re-reads it from
+    /// message RAM for every received frame, so the element is disabled
+    /// (EFEC = 0) and flushed before EFID2 changes, then re-enabled once both
+    /// words are in place. A frame arriving mid-update therefore matches
+    /// either the old filter or the new one, never a mix of the two.
+    fn write_ext_filter(&self, index: usize, w0: u32, w1: u32) {
+        let shadow = STD_FILTER_WORDS + index * 2;
+        let word = EXT_FILTER_OFFSET + index * 2;
+
+        self.filters[shadow].set(w0);
+        self.filters[shadow + 1].set(w1);
+
+        self.msg_ram.map(|ram| {
+            ram.words[word] = FILTER_CONFIG_DISABLED;
+        });
+        self.clean_filter_region();
+
+        self.msg_ram.map(|ram| {
+            ram.words[word + 1] = w1;
+            ram.words[word] = w0;
+        });
+        self.clean_filter_region();
+    }
+}
+
+/// Filter numbering is a single flat space across both hardware filter lists:
+/// `0..STD_FILTER_COUNT` address the standard (11-bit) elements and the
+/// following `EXT_FILTER_COUNT` numbers address the extended (29-bit) ones.
+/// `enable_filter` rejects a number whose list does not match the variant of
+/// [`can::Id`] supplied with it.
+///
+/// Unlike the HIL's note on [`can::Receive::start_receive_process`], filters
+/// may be installed at any time, before or after `enable()`. Elements are
+/// shadowed in the driver and re-applied whenever message RAM is set up.
+impl can::Filter for Mcan {
+    fn enable_filter(&self, filter: can::FilterParameters) -> Result<(), ErrorCode> {
+        // Only RX FIFO 0 is configured; see `setup_message_ram`.
+        if filter.fifo_number != 0 {
+            return Err(ErrorCode::INVAL);
+        }
+
+        let number = filter.number as usize;
+
+        match filter.id {
+            can::Id::Standard(id) => {
+                if number >= STD_FILTER_COUNT {
+                    return Err(ErrorCode::INVAL);
+                }
+                let mask = match filter.identifier_mode {
+                    can::IdentifierMode::List => STD_ID_MASK,
+                    can::IdentifierMode::Mask => filter.mask & STD_ID_MASK,
+                };
+                self.write_std_filter(
+                    number,
+                    (FILTER_TYPE_CLASSIC << 30)
+                        | (FILTER_CONFIG_FIFO0 << 27)
+                        | ((u32::from(id) & STD_ID_MASK) << 16)
+                        | mask,
+                );
+                Ok(())
+            }
+            can::Id::Extended(id) => {
+                if number < STD_FILTER_COUNT || number >= STD_FILTER_COUNT + EXT_FILTER_COUNT {
+                    return Err(ErrorCode::INVAL);
+                }
+                let mask = match filter.identifier_mode {
+                    can::IdentifierMode::List => EXT_ID_MASK,
+                    can::IdentifierMode::Mask => filter.mask & EXT_ID_MASK,
+                };
+                self.write_ext_filter(
+                    number - STD_FILTER_COUNT,
+                    (FILTER_CONFIG_FIFO0 << 29) | (id & EXT_ID_MASK),
+                    (FILTER_TYPE_CLASSIC << 30) | mask,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn disable_filter(&self, number: u32) -> Result<(), ErrorCode> {
+        let number = number as usize;
+        if number < STD_FILTER_COUNT {
+            self.write_std_filter(number, FILTER_CONFIG_DISABLED);
+            Ok(())
+        } else if number < STD_FILTER_COUNT + EXT_FILTER_COUNT {
+            self.write_ext_filter(
+                number - STD_FILTER_COUNT,
+                FILTER_CONFIG_DISABLED,
+                FILTER_CONFIG_DISABLED,
+            );
+            Ok(())
+        } else {
+            Err(ErrorCode::INVAL)
+        }
+    }
+
+    fn filter_count(&self) -> usize {
+        STD_FILTER_COUNT + EXT_FILTER_COUNT
     }
 }

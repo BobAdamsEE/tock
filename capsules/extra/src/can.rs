@@ -7,47 +7,53 @@
 
 //! Syscall driver capsule for CAN communication.
 //!
-//! This module has a CAN syscall driver capsule implementation.
+//! Several processes may use the CAN bus at once. Each one gets its own
+//! buffers, upcalls and identifier subscriptions; the capsule serializes
+//! transmission between them and fans received frames out to every process
+//! that asked for the identifier.
 //!
-//! This capsule sends commands from the userspace to a driver that
-//! implements the Can trait.
+//! Reception is opt-in. A process registers the identifiers it wants with
+//! `subscribe_standard` / `subscribe_extended`, and receives nothing until it
+//! does. This replaces the previous behaviour, where a single owning process
+//! received every frame the hardware accepted and discarded the rest itself.
 //!
-//! The capsule shares 2 buffers with the userspace: one RO that is used
-//! for transmitting messages and one RW that is used for receiving
-//! messages.
+//! The receive buffer is a `StreamingProcessSlice`: an 8-byte header followed
+//! by fixed 16-byte chunks, one per frame.
 //!
-//! The RO buffer uses the first 4 bytes as a counter of how many messages
-//! the userspace must read, at the time the upcall was sent. If the
-//! userspace is slower and in the meantime there were other messages
-//! that were received, the userspace reads them all and sends to the
-//! capsule a new buffer that has the counter on the first 4 bytes 0.
-//! Because of that, when receiving a callback from the driver regarding
-//! a received message, the capsule checks the counter:
-//! - if it's 0, the message will be copied to the RW buffer, the counter
-//!   will be incremented and an upcall will be sent
-//! - if it's greater the 0, the message will be copied to the RW buffer
-//!   but no upcall will be done
+//! ```text
+//! offset  size  field
+//!      0     4  identifier, little endian
+//!      4     1  data length, 0..=8
+//!      5     1  flags: bit 0 set for a 29-bit (extended) identifier
+//!      6     2  reserved, zero
+//!      8     8  data
+//! ```
+//!
+//! The identifier travels *in the chunk* rather than only as an upcall
+//! argument, because several frames can be appended before a process is
+//! scheduled; with the identifier passed out of band, only the last one would
+//! be knowable and a burst could not be demultiplexed.
+//!
+//! Bitrate, bit timing and operation mode are properties of the shared bus, so
+//! they are configured once during board setup and are no longer reachable
+//! from userspace.
 //!
 //! Usage
 //! -----
 //!
-//! You need a driver that implements the Can trait.
 //! ```rust,ignore
-//! let grant_cap = create_capability!(capabilities::MemoryAllocationCapability);
-//! let grant_can = self.board_kernel.create_grant(
-//!     capsules::can::CanCapsule::DRIVER_NUM, &grant_cap);
-//! let can = capsules::can::CanCapsule::new(
-//!    can_peripheral,
-//!    grant_can,
-//!    tx_buffer,
-//!    rx_buffer,
+//! let can = capsules_extra::can::CanCapsule::new(
+//!     can_device,          // anything implementing hil::can::Can
+//!     Some(can_device),    // optional &dyn Subscribe, to track subscriptions
+//!     grant_can,
+//!     tx_buffer,
+//!     rx_buffer,
 //! );
 //!
-//! kernel::hil::can::Controller::set_client(can_peripheral, Some(can));
-//! kernel::hil::can::Transmit::set_client(can_peripheral, Some(can));
-//! kernel::hil::can::Receive::set_client(can_peripheral, Some(can));
+//! kernel::hil::can::Controller::set_client(can_device, Some(can));
+//! kernel::hil::can::Transmit::set_client(can_device, Some(can));
+//! kernel::hil::can::Receive::set_client(can_device, Some(can));
 //! ```
-//!
 
 use core::mem::size_of;
 
@@ -61,11 +67,21 @@ use kernel::ErrorCode;
 use kernel::ProcessId;
 
 use capsules_core::driver;
+use capsules_core::virtualizers::virtual_can::{covering_filter, Subscribe, Subscription};
+
 pub const DRIVER_NUM: usize = driver::NUM::Can as usize;
-pub const BYTE4_MASK: usize = 0xff000000;
-pub const BYTE3_MASK: usize = 0xff0000;
-pub const BYTE2_MASK: usize = 0xff00;
-pub const BYTE1_MASK: usize = 0xff;
+
+/// Identifier subscriptions each process may hold.
+pub const MAX_APP_SUBSCRIPTIONS: usize = 4;
+
+/// Upper bound on subscriptions collected across all processes when
+/// recomputing the device's view. Extra ones are covered by the fallback.
+const MAX_TOTAL_SUBSCRIPTIONS: usize = 16;
+
+/// Bytes per frame in the receive buffer. See the module documentation.
+pub const RX_CHUNK_SIZE: usize = 16;
+
+const CHUNK_FLAG_EXTENDED: u8 = 0x01;
 
 mod error_upcalls {
     pub const ERROR_TX: usize = 100;
@@ -93,35 +109,75 @@ mod rw_allow {
 }
 
 pub struct CanCapsule<'a, Can: can::Can> {
-    // CAN driver
     can: &'a Can,
 
-    // CAN buffers
+    /// Optional handle for keeping the underlying device's subscriptions in
+    /// step with the union of the processes'. `None` when the capsule sits on
+    /// a bare peripheral, in which case acceptance is whatever the board
+    /// configured and only the per-process software filter applies.
+    subscriber: Option<&'a dyn Subscribe>,
+
     can_tx: TakeCell<'static, [u8; can::STANDARD_CAN_PACKET_SIZE]>,
     can_rx: TakeCell<'static, [u8; can::STANDARD_CAN_PACKET_SIZE]>,
 
-    // Process
     processes: Grant<
         App,
         UpcallCount<{ up_calls::COUNT }>,
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
-    processid: OptionalCell<ProcessId>,
 
-    // Variable used to store the current state of the CAN peripheral
-    // during an `enable` or `disable` command.
+    /// Process whose frame is currently with the hardware.
+    tx_inflight: OptionalCell<ProcessId>,
+
+    /// How many processes want the peripheral enabled / receiving.
+    enable_count: core::cell::Cell<usize>,
+    receive_count: core::cell::Cell<usize>,
+    hw_enabled: core::cell::Cell<bool>,
+    hw_receiving: core::cell::Cell<bool>,
+
     peripheral_state: OptionalCell<can::State>,
 }
 
-#[derive(Default)]
 pub struct App {
+    subscriptions: [Option<Subscription>; MAX_APP_SUBSCRIPTIONS],
+    /// This process asked for the peripheral to be enabled.
+    enabled: bool,
+    /// Waiting on the enable/disable callback the hardware will deliver.
+    awaiting_enable: bool,
+    awaiting_disable: bool,
+    /// This process asked to receive.
+    receiving: bool,
+    /// Queued transmission, waiting for the shared transmit slot.
+    ///
+    /// The frame's bytes are copied in when it is queued rather than read back
+    /// out of the process buffer when the slot frees up. A process does not
+    /// stop running while its frame waits -- with several processes sharing
+    /// one transmit slot a frame can wait for milliseconds -- so by the time
+    /// it reached the hardware the buffer could hold the *next* frame, and the
+    /// wrong bytes would go out under the right identifier.
+    tx_pending: Option<(can::Id, usize, [u8; can::STANDARD_CAN_PACKET_SIZE])>,
     lost_messages: u32,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App {
+            subscriptions: [None; MAX_APP_SUBSCRIPTIONS],
+            enabled: false,
+            awaiting_enable: false,
+            awaiting_disable: false,
+            receiving: false,
+            tx_pending: None,
+            lost_messages: 0,
+        }
+    }
 }
 
 impl<'a, Can: can::Can> CanCapsule<'a, Can> {
     pub fn new(
         can: &'a Can,
+        subscriber: Option<&'a dyn Subscribe>,
         grant: Grant<
             App,
             UpcallCount<{ up_calls::COUNT }>,
@@ -133,30 +189,98 @@ impl<'a, Can: can::Can> CanCapsule<'a, Can> {
     ) -> CanCapsule<'a, Can> {
         CanCapsule {
             can,
+            subscriber,
             can_tx: TakeCell::new(can_tx),
             can_rx: TakeCell::new(can_rx),
             processes: grant,
+            tx_inflight: OptionalCell::empty(),
+            enable_count: core::cell::Cell::new(0),
+            receive_count: core::cell::Cell::new(0),
+            hw_enabled: core::cell::Cell::new(false),
+            hw_receiving: core::cell::Cell::new(false),
             peripheral_state: OptionalCell::empty(),
-            processid: OptionalCell::empty(),
         }
     }
 
-    fn schedule_callback(&self, callback_number: usize, data: (usize, usize, usize)) {
-        self.processid.map(|processid| {
-            let _ = self.processes.enter(processid, |_app, kernel_data| {
-                let _ = kernel_data.schedule_upcall(callback_number, (data.0, data.1, data.2));
-            });
+    fn upcall(&self, processid: ProcessId, number: usize, data: (usize, usize, usize)) {
+        let _ = self.processes.enter(processid, |_, kernel_data| {
+            let _ = kernel_data.schedule_upcall(number, data);
         });
     }
 
-    /// This function makes a copy of the buffer in the grant and sends it
-    /// to the low-level hardware, in order for it to be sent on the bus.
-    pub fn process_send_command(
+    /// Rebuild the device's subscriptions from the union of every process's.
+    ///
+    /// Must not be called while inside `processes.enter()` for any process, or
+    /// that process's subscriptions would be skipped.
+    fn resync_subscriptions(&self) {
+        let Some(subscriber) = self.subscriber else {
+            return;
+        };
+        subscriber.clear_subscriptions();
+
+        let mut all = [Subscription {
+            id: can::Id::Standard(0),
+            mask: 0,
+        }; MAX_TOTAL_SUBSCRIPTIONS];
+        let mut count = 0;
+
+        for process in self.processes.iter() {
+            process.enter(|app, _| {
+                for slot in app.subscriptions.iter() {
+                    if let Some(s) = slot {
+                        if count < all.len() {
+                            all[count] = *s;
+                            count += 1;
+                        }
+                    }
+                }
+            });
+        }
+
+        if count == 0 {
+            return;
+        }
+
+        if count <= subscriber.subscription_capacity() {
+            for s in all.iter().take(count) {
+                let _ = subscriber.subscribe(s.id, s.mask);
+            }
+            return;
+        }
+
+        // Too many to install individually: one covering subscription per
+        // identifier class accepts a superset, and the per-process filter in
+        // `message_received` rejects the extras.
+        for extended in [false, true] {
+            let mut class = [Subscription {
+                id: can::Id::Standard(0),
+                mask: 0,
+            }; MAX_TOTAL_SUBSCRIPTIONS];
+            let mut n = 0;
+            for s in all.iter().take(count) {
+                if matches!(s.id, can::Id::Extended(_)) == extended {
+                    class[n] = *s;
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                if let Some(cover) = covering_filter(&class[..n]) {
+                    let _ = subscriber.subscribe(cover.id, cover.mask);
+                }
+            }
+        }
+    }
+
+    /// Read this process's transmit buffer into `frame`.
+    fn copy_out_frame(
         &self,
         processid: ProcessId,
-        id: can::Id,
         length: usize,
+        frame: &mut [u8; can::STANDARD_CAN_PACKET_SIZE],
     ) -> Result<(), ErrorCode> {
+        if length > can::STANDARD_CAN_PACKET_SIZE {
+            return Err(ErrorCode::SIZE);
+        }
         self.processes
             .enter(processid, |_, kernel_data| {
                 kernel_data
@@ -166,21 +290,13 @@ impl<'a, Can: can::Can> CanCapsule<'a, Can> {
                         |buffer_ref| {
                             buffer_ref
                                 .enter(|buffer| {
-                                    self.can_tx.take().map_or(
-                                        Err(ErrorCode::NOMEM),
-                                        |dest_buffer| {
-                                            for i in 0..length {
-                                                dest_buffer[i] = buffer[i].get();
-                                            }
-                                            match self.can.send(id, dest_buffer, length) {
-                                                Ok(()) => Ok(()),
-                                                Err((err, buf)) => {
-                                                    self.can_tx.replace(buf);
-                                                    Err(err)
-                                                }
-                                            }
-                                        },
-                                    )
+                                    if buffer.len() < length {
+                                        return Err(ErrorCode::SIZE);
+                                    }
+                                    for i in 0..length {
+                                        frame[i] = buffer[i].get();
+                                    }
+                                    Ok(())
                                 })
                                 .unwrap_or_else(|err| err.into())
                         },
@@ -189,12 +305,52 @@ impl<'a, Can: can::Can> CanCapsule<'a, Can> {
             .unwrap_or_else(|err| err.into())
     }
 
-    pub fn is_valid_process(&self, processid: ProcessId) -> bool {
-        self.processid.map_or(true, |owning_process| {
-            self.processes
-                .enter(owning_process, |_, _| owning_process == processid)
-                .unwrap_or(true)
+    /// Put an already-copied frame into the shared buffer and start it.
+    fn start_transmission(
+        &self,
+        id: can::Id,
+        frame: &[u8; can::STANDARD_CAN_PACKET_SIZE],
+        length: usize,
+    ) -> Result<(), ErrorCode> {
+        if length > can::STANDARD_CAN_PACKET_SIZE {
+            return Err(ErrorCode::SIZE);
+        }
+        self.can_tx.take().map_or(Err(ErrorCode::NOMEM), |dest| {
+            dest[..length].copy_from_slice(&frame[..length]);
+            match self.can.send(id, dest, length) {
+                Ok(()) => Ok(()),
+                Err((err, buf)) => {
+                    self.can_tx.replace(buf);
+                    Err(err)
+                }
+            }
         })
+    }
+
+    /// Hand the transmitter to the next process with a queued frame.
+    fn next_transmission(&self) {
+        if self.tx_inflight.is_some() {
+            return;
+        }
+        for process in self.processes.iter() {
+            let processid = process.processid();
+            let queued = process.enter(|app, _| app.tx_pending.take());
+            if let Some((id, length, frame)) = queued {
+                match self.start_transmission(id, &frame, length) {
+                    Ok(()) => {
+                        self.tx_inflight.set(processid);
+                        return;
+                    }
+                    Err(err) => {
+                        self.upcall(
+                            processid,
+                            up_calls::UPCALL_TRANSMISSION_ERROR,
+                            (error_upcalls::ERROR_TX, err as usize, 0),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -211,129 +367,273 @@ impl<Can: can::Can> SyscallDriver for CanCapsule<'_, Can> {
             return CommandReturn::success();
         }
 
-        // Check to see if the process or no process at all
-        // owns the capsule. Only one application can use the
-        // capsule at a time.
-        if !self.is_valid_process(processid) {
-            return CommandReturn::failure(ErrorCode::RESERVE);
-        } else {
-            self.processid.set(processid);
-        }
-
         match command_num {
-            // Set the bitrate
-            1 => match self.can.set_bitrate(arg1 as u32) {
-                Ok(()) => CommandReturn::success(),
-                Err(err) => CommandReturn::failure(err),
-            },
+            // Bitrate (1), operation mode (2) and bit timing (9) describe the
+            // shared bus, not one process's use of it. They are set during
+            // board setup; letting any process change them out from under the
+            // others was a bug waiting to happen.
+            1 | 2 | 9 => CommandReturn::failure(ErrorCode::NOSUPPORT),
 
-            // Set the operation mode (Loopback, Monitoring, etc)
-            2 => {
-                match self.can.set_operation_mode(match arg1 {
-                    0 => can::OperationMode::Loopback,
-                    1 => can::OperationMode::Monitoring,
-                    2 => can::OperationMode::Freeze,
-                    _ => can::OperationMode::Normal,
-                }) {
-                    Ok(()) => CommandReturn::success(),
-                    Err(err) => CommandReturn::failure(err),
-                }
-            }
-
-            // Enable the peripheral
-            3 => match self.can.enable() {
-                Ok(()) => CommandReturn::success(),
-                Err(err) => CommandReturn::failure(err),
-            },
-
-            // Disable the peripheral
-            4 => match self.can.disable() {
-                Ok(()) => CommandReturn::success(),
-                Err(err) => CommandReturn::failure(err),
-            },
-
-            // Send a message with a 16-bit identifier
-            5 => {
-                let id = can::Id::Standard(arg1 as u16);
-                self.processid
-                    .map_or(
-                        CommandReturn::failure(ErrorCode::BUSY),
-                        |processid| match self.process_send_command(processid, id, arg2) {
-                            Ok(()) => CommandReturn::success(),
-                            Err(err) => CommandReturn::failure(err),
-                        },
-                    )
-            }
-
-            // Send a message with a 32-bit identifier
-            6 => {
-                let id = can::Id::Extended(arg1 as u32);
-                self.processid
-                    .map_or(
-                        CommandReturn::failure(ErrorCode::BUSY),
-                        |processid| match self.process_send_command(processid, id, arg2) {
-                            Ok(()) => CommandReturn::success(),
-                            Err(err) => CommandReturn::failure(err),
-                        },
-                    )
-            }
-
-            // Start receiving messages
-            7 => {
-                self.can_rx
-                    .take()
-                    .map_or(CommandReturn::failure(ErrorCode::NOMEM), |dest_buffer| {
-                        self.processes
-                            .enter(processid, |_, kernel| {
-                                match kernel.get_readwrite_processbuffer(0).map_or_else(
-                                    |err| err.into(),
-                                    |buffer_ref| {
-                                        buffer_ref
-                                            .enter(|buffer| {
-                                                // make sure that the receiving buffer can have at least
-                                                // 2 messages of 8 bytes each and 4 another bytes for the counter
-                                                if buffer.len()
-                                                    >= 2 * can::STANDARD_CAN_PACKET_SIZE
-                                                        + size_of::<u32>()
-                                                {
-                                                    Ok(())
-                                                } else {
-                                                    Err(ErrorCode::SIZE)
-                                                }
-                                            })
-                                            .unwrap_or_else(|err| err.into())
-                                    },
-                                ) {
-                                    Ok(()) => match self.can.start_receive_process(dest_buffer) {
-                                        Ok(()) => CommandReturn::success(),
-                                        Err((err, _)) => CommandReturn::failure(err),
-                                    },
-                                    Err(err) => CommandReturn::failure(err),
+            // Enable the peripheral.
+            3 => {
+                let already = self.hw_enabled.get();
+                let res = self.processes.enter(processid, |app, _| {
+                    if app.enabled {
+                        return Err(ErrorCode::ALREADY);
+                    }
+                    app.enabled = true;
+                    app.awaiting_enable = !already;
+                    Ok(())
+                });
+                match res {
+                    Ok(Ok(())) => {
+                        self.enable_count.set(self.enable_count.get() + 1);
+                        if already {
+                            // Running for someone else already.
+                            self.upcall(processid, up_calls::UPCALL_ENABLE, (0, 0, 0));
+                            CommandReturn::success()
+                        } else if self.enable_count.get() == 1 {
+                            match self.can.enable() {
+                                Ok(()) => CommandReturn::success(),
+                                Err(err) => {
+                                    self.enable_count
+                                        .set(self.enable_count.get().saturating_sub(1));
+                                    let _ = self.processes.enter(processid, |app, _| {
+                                        app.enabled = false;
+                                        app.awaiting_enable = false;
+                                    });
+                                    CommandReturn::failure(err)
                                 }
-                            })
-                            .unwrap_or_else(|err| err.into())
-                    })
-            }
-
-            // Stop receiving messages
-            8 => match self.can.stop_receive() {
-                Ok(()) => CommandReturn::success(),
-                Err(err) => CommandReturn::failure(err),
-            },
-
-            // Set the timing parameters
-            9 => {
-                match self.can.set_bit_timing(can::BitTiming {
-                    segment1: ((arg1 & BYTE4_MASK) >> 24) as u8,
-                    segment2: ((arg1 & BYTE3_MASK) >> 16) as u8,
-                    propagation: arg2 as u8,
-                    sync_jump_width: ((arg1 & BYTE2_MASK) >> 8) as u32,
-                    baud_rate_prescaler: (arg1 & BYTE1_MASK) as u32,
-                }) {
-                    Ok(()) => CommandReturn::success(),
-                    Err(err) => CommandReturn::failure(err),
+                            }
+                        } else {
+                            // An enable is already in flight; its completion
+                            // notifies every waiting process.
+                            CommandReturn::success()
+                        }
+                    }
+                    Ok(Err(err)) => CommandReturn::failure(err),
+                    Err(err) => CommandReturn::failure(err.into()),
                 }
             }
+
+            // Disable the peripheral.
+            4 => {
+                let res = self.processes.enter(processid, |app, _| {
+                    if !app.enabled {
+                        return Err(ErrorCode::ALREADY);
+                    }
+                    app.enabled = false;
+                    Ok(())
+                });
+                match res {
+                    Ok(Ok(())) => {
+                        self.enable_count
+                            .set(self.enable_count.get().saturating_sub(1));
+                        if self.enable_count.get() > 0 {
+                            // Others still need the bus.
+                            self.upcall(processid, up_calls::UPCALL_DISABLE, (0, 0, 0));
+                            CommandReturn::success()
+                        } else {
+                            let _ = self.processes.enter(processid, |app, _| {
+                                app.awaiting_disable = true;
+                            });
+                            match self.can.disable() {
+                                Ok(()) => CommandReturn::success(),
+                                Err(err) => {
+                                    let _ = self.processes.enter(processid, |app, _| {
+                                        app.awaiting_disable = false;
+                                    });
+                                    CommandReturn::failure(err)
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => CommandReturn::failure(err),
+                    Err(err) => CommandReturn::failure(err.into()),
+                }
+            }
+
+            // Send a frame with an 11-bit (5) or 29-bit (6) identifier.
+            5 | 6 => {
+                let id = if command_num == 5 {
+                    can::Id::Standard(arg1 as u16)
+                } else {
+                    can::Id::Extended(arg1 as u32)
+                };
+
+                // Read the frame out of the process buffer now, whether it goes
+                // straight to the hardware or waits for the shared slot. See
+                // `App::tx_pending`.
+                let mut frame = [0u8; can::STANDARD_CAN_PACKET_SIZE];
+                if let Err(err) = self.copy_out_frame(processid, arg2, &mut frame) {
+                    return CommandReturn::failure(err);
+                }
+
+                if self.tx_inflight.is_none() {
+                    match self.start_transmission(id, &frame, arg2) {
+                        Ok(()) => {
+                            self.tx_inflight.set(processid);
+                            CommandReturn::success()
+                        }
+                        Err(err) => CommandReturn::failure(err),
+                    }
+                } else {
+                    // Queue behind the frame currently on the bus.
+                    let res = self.processes.enter(processid, |app, _| {
+                        if app.tx_pending.is_some() {
+                            return Err(ErrorCode::BUSY);
+                        }
+                        app.tx_pending = Some((id, arg2, frame));
+                        Ok(())
+                    });
+                    match res {
+                        Ok(Ok(())) => CommandReturn::success(),
+                        Ok(Err(err)) => CommandReturn::failure(err),
+                        Err(err) => CommandReturn::failure(err.into()),
+                    }
+                }
+            }
+
+            // Start receiving.
+            7 => {
+                let res = self.processes.enter(processid, |app, kernel| {
+                    if app.receiving {
+                        return Err(ErrorCode::ALREADY);
+                    }
+                    kernel
+                        .get_readwrite_processbuffer(rw_allow::RW_ALLOW_BUFFER)
+                        .map_or_else(
+                            |err| Err(err.into()),
+                            |buffer_ref| {
+                                buffer_ref
+                                    .enter(|buffer| {
+                                        // Room for the header plus at least
+                                        // two frames.
+                                        if buffer.len() >= 2 * RX_CHUNK_SIZE + 2 * size_of::<u32>()
+                                        {
+                                            Ok(())
+                                        } else {
+                                            Err(ErrorCode::SIZE)
+                                        }
+                                    })
+                                    .unwrap_or_else(|err| Err(err.into()))
+                            },
+                        )?;
+                    app.receiving = true;
+                    Ok(())
+                });
+
+                match res {
+                    Ok(Ok(())) => {
+                        self.receive_count.set(self.receive_count.get() + 1);
+                        if self.hw_receiving.get() {
+                            return CommandReturn::success();
+                        }
+                        match self.can_rx.take() {
+                            Some(buffer) => match self.can.start_receive_process(buffer) {
+                                Ok(()) => {
+                                    self.hw_receiving.set(true);
+                                    CommandReturn::success()
+                                }
+                                Err((err, buffer)) => {
+                                    self.can_rx.replace(buffer);
+                                    self.receive_count
+                                        .set(self.receive_count.get().saturating_sub(1));
+                                    let _ = self.processes.enter(processid, |app, _| {
+                                        app.receiving = false;
+                                    });
+                                    CommandReturn::failure(err)
+                                }
+                            },
+                            None => {
+                                self.receive_count
+                                    .set(self.receive_count.get().saturating_sub(1));
+                                CommandReturn::failure(ErrorCode::NOMEM)
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => CommandReturn::failure(err),
+                    Err(err) => CommandReturn::failure(err.into()),
+                }
+            }
+
+            // Stop receiving.
+            8 => {
+                let res = self.processes.enter(processid, |app, _| {
+                    if !app.receiving {
+                        return Err(ErrorCode::ALREADY);
+                    }
+                    app.receiving = false;
+                    Ok(())
+                });
+                match res {
+                    Ok(Ok(())) => {
+                        self.receive_count
+                            .set(self.receive_count.get().saturating_sub(1));
+                        if self.receive_count.get() > 0 || !self.hw_receiving.get() {
+                            self.upcall(processid, up_calls::UPCALL_RECEIVED_STOPPED, (0, 0, 0));
+                            CommandReturn::success()
+                        } else {
+                            match self.can.stop_receive() {
+                                Ok(()) => CommandReturn::success(),
+                                Err(err) => CommandReturn::failure(err),
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => CommandReturn::failure(err),
+                    Err(err) => CommandReturn::failure(err.into()),
+                }
+            }
+
+            // Subscribe to an 11-bit (10) or 29-bit (11) identifier range.
+            // arg1 = identifier, arg2 = mask. A frame matches when
+            // `(received & mask) == (id & mask)`.
+            10 | 11 => {
+                let id = if command_num == 10 {
+                    can::Id::Standard(arg1 as u16)
+                } else {
+                    can::Id::Extended(arg1 as u32)
+                };
+                let subscription = Subscription {
+                    id,
+                    mask: arg2 as u32,
+                };
+                let res = self.processes.enter(processid, |app, _| {
+                    for slot in app.subscriptions.iter_mut() {
+                        if slot.is_none() {
+                            *slot = Some(subscription);
+                            return Ok(());
+                        }
+                    }
+                    Err(ErrorCode::NOMEM)
+                });
+                match res {
+                    // Outside the grant: resync re-enters every process.
+                    Ok(Ok(())) => {
+                        self.resync_subscriptions();
+                        CommandReturn::success()
+                    }
+                    Ok(Err(err)) => CommandReturn::failure(err),
+                    Err(err) => CommandReturn::failure(err.into()),
+                }
+            }
+
+            // Drop all of this process's subscriptions.
+            12 => {
+                let res = self.processes.enter(processid, |app, _| {
+                    app.subscriptions = [None; MAX_APP_SUBSCRIPTIONS];
+                });
+                match res {
+                    Ok(()) => {
+                        self.resync_subscriptions();
+                        CommandReturn::success()
+                    }
+                    Err(err) => CommandReturn::failure(err.into()),
+                }
+            }
+
+            // How many subscriptions a process may hold.
+            13 => CommandReturn::success_u32(MAX_APP_SUBSCRIPTIONS as u32),
 
             _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
         }
@@ -345,157 +645,220 @@ impl<Can: can::Can> SyscallDriver for CanCapsule<'_, Can> {
 }
 
 impl<Can: can::Can> can::ControllerClient for CanCapsule<'_, Can> {
-    // This callback must be called after an `enable` or `disable` command was sent.
-    // It stores the new state of the peripheral.
     fn state_changed(&self, state: can::State) {
         self.peripheral_state.replace(state);
     }
 
-    // This callback must be called after an `enable` command was sent and after a
-    // `state_changed` callback was called. If there is no error and the state of
-    // the peripheral is Running, send to the userspace a success callback.
-    // If the state is different or the status is an error, send to the userspace an
-    // error callback.
     fn enabled(&self, status: Result<(), ErrorCode>) {
-        match status {
+        let code = match status {
             Ok(()) => match self.peripheral_state.take() {
                 Some(can::State::Running) => {
-                    self.schedule_callback(up_calls::UPCALL_ENABLE, (0, 0, 0));
+                    self.hw_enabled.set(true);
+                    0
                 }
-                Some(can::State::Error(err)) => {
-                    self.schedule_callback(up_calls::UPCALL_ENABLE, (err as usize, 0, 0));
-                }
-                Some(can::State::Disabled) | None => {
-                    self.schedule_callback(
-                        up_calls::UPCALL_ENABLE,
-                        (ErrorCode::OFF as usize, 0, 0),
-                    );
-                }
+                Some(can::State::Error(err)) => err as usize,
+                Some(can::State::Disabled) | None => ErrorCode::OFF as usize,
             },
             Err(err) => {
                 self.peripheral_state.take();
-                self.schedule_callback(up_calls::UPCALL_ENABLE, (err as usize, 0, 0));
+                err as usize
+            }
+        };
+
+        if code != 0 {
+            self.enable_count.set(0);
+        }
+
+        for process in self.processes.iter() {
+            let processid = process.processid();
+            let notify = process.enter(|app, _| {
+                if app.awaiting_enable {
+                    app.awaiting_enable = false;
+                    if code != 0 {
+                        app.enabled = false;
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+            if notify {
+                self.upcall(processid, up_calls::UPCALL_ENABLE, (code, 0, 0));
             }
         }
     }
 
-    // This callback must be called after an `disable` command was sent and after a
-    // `state_changed` callback was called. If there is no error and  the state of
-    // the peripheral is Disabled, send to the userspace a success callback.
-    // If the state is different or the status is an error, send to the userspace an
-    // error callback.
     fn disabled(&self, status: Result<(), ErrorCode>) {
-        match status {
+        self.hw_enabled.set(false);
+        self.hw_receiving.set(false);
+
+        let code = match status {
             Ok(()) => match self.peripheral_state.take() {
-                Some(can::State::Disabled) => {
-                    self.schedule_callback(up_calls::UPCALL_DISABLE, (0, 0, 0));
-                }
-                Some(can::State::Error(err)) => {
-                    self.schedule_callback(up_calls::UPCALL_DISABLE, (err as usize, 0, 0));
-                }
-                Some(can::State::Running) | None => {
-                    self.schedule_callback(
-                        up_calls::UPCALL_DISABLE,
-                        (ErrorCode::FAIL as usize, 0, 0),
-                    );
-                }
+                Some(can::State::Disabled) => 0,
+                Some(can::State::Error(err)) => err as usize,
+                Some(can::State::Running) | None => ErrorCode::FAIL as usize,
             },
             Err(err) => {
                 self.peripheral_state.take();
-                self.schedule_callback(up_calls::UPCALL_ENABLE, (err as usize, 0, 0));
+                err as usize
+            }
+        };
+
+        for process in self.processes.iter() {
+            let processid = process.processid();
+            let notify = process.enter(|app, _| {
+                if app.awaiting_disable {
+                    app.awaiting_disable = false;
+                    true
+                } else {
+                    false
+                }
+            });
+            if notify {
+                self.upcall(processid, up_calls::UPCALL_DISABLE, (code, 0, 0));
             }
         }
-        self.processid.clear();
     }
 }
 
 impl<Can: can::Can> can::TransmitClient<{ can::STANDARD_CAN_PACKET_SIZE }> for CanCapsule<'_, Can> {
-    // This callback is called when the hardware acknowledges that a message
-    // was sent. This callback also makes an upcall to the userspace.
     fn transmit_complete(
         &self,
         status: Result<(), can::Error>,
         buffer: &'static mut [u8; can::STANDARD_CAN_PACKET_SIZE],
     ) {
         self.can_tx.replace(buffer);
-        match status {
-            Ok(()) => self.schedule_callback(up_calls::UPCALL_MESSAGE_SENT, (0, 0, 0)),
-            Err(err) => {
-                self.schedule_callback(
+
+        if let Some(processid) = self.tx_inflight.take() {
+            match status {
+                Ok(()) => self.upcall(processid, up_calls::UPCALL_MESSAGE_SENT, (0, 0, 0)),
+                Err(err) => self.upcall(
+                    processid,
                     up_calls::UPCALL_TRANSMISSION_ERROR,
                     (error_upcalls::ERROR_TX, err as usize, 0),
-                );
+                ),
             }
         }
+
+        self.next_transmission();
     }
 }
 
 impl<Can: can::Can> can::ReceiveClient<{ can::STANDARD_CAN_PACKET_SIZE }> for CanCapsule<'_, Can> {
-    // This callback is called when a new message is received on any receiving
-    // fifo.
     fn message_received(
         &self,
         id: can::Id,
         buffer: &mut [u8; can::STANDARD_CAN_PACKET_SIZE],
-        _len: usize,
+        len: usize,
         status: Result<(), can::Error>,
     ) {
-        match status {
-            Ok(()) => {
-                let res: Result<(bool, u32), ErrorCode> =
-                    self.processid.map_or(Err(ErrorCode::NOMEM), |processid| {
-                        self.processes
-                            .enter(processid, |app_data, kernel_data| {
-                                kernel_data
-                                    .get_readwrite_processbuffer(rw_allow::RW_ALLOW_BUFFER)
-                                    .map_or_else(
-                                        |err| Err(err.into()),
-                                        |buffer_ref| {
-                                            buffer_ref
-                                                .mut_enter(|user_slice| {
-                                                    StreamingProcessSlice::new(user_slice)
-                                                        .append_chunk(buffer)
-                                                        .inspect_err(|_err| {
-                                                            app_data.lost_messages += 1;
-                                                        })
-                                                })
-                                                .unwrap_or_else(|err| Err(err.into()))
-                                        },
-                                    )
-                            })
-                            .unwrap_or_else(|err| Err(err.into()))
-                    });
-
-                match res {
-                    Err(err) => self.schedule_callback(
+        if let Err(err) = status {
+            for process in self.processes.iter() {
+                let processid = process.processid();
+                let receiving = process.enter(|app, _| app.receiving);
+                if receiving {
+                    self.upcall(
+                        processid,
                         up_calls::UPCALL_TRANSMISSION_ERROR,
                         (error_upcalls::ERROR_RX, err as usize, 0),
-                    ),
-                    Ok((_first_chunk, new_offset)) => self.schedule_callback(
-                        up_calls::UPCALL_MESSAGE_RECEIVED,
-                        (
-                            0,
-                            new_offset as usize,
-                            match id {
-                                can::Id::Standard(u16) => u16 as usize,
-                                can::Id::Extended(u32) => u32 as usize,
-                            },
-                        ),
-                    ),
+                    );
                 }
             }
-            Err(err) => {
-                let kernel_err: ErrorCode = err.into();
-                self.schedule_callback(
-                    up_calls::UPCALL_TRANSMISSION_ERROR,
-                    (error_upcalls::ERROR_RX, kernel_err.into(), 0),
+            return;
+        }
+
+        // Fixed-size chunk so a process can walk the buffer without parsing
+        // variable-length records. See the module documentation.
+        let raw_id = match id {
+            can::Id::Standard(v) => v as u32,
+            can::Id::Extended(v) => v,
+        };
+        let mut chunk = [0u8; RX_CHUNK_SIZE];
+        chunk[0..4].copy_from_slice(&raw_id.to_le_bytes());
+        chunk[4] = len.min(can::STANDARD_CAN_PACKET_SIZE) as u8;
+        chunk[5] = if matches!(id, can::Id::Extended(_)) {
+            CHUNK_FLAG_EXTENDED
+        } else {
+            0
+        };
+        chunk[8..8 + can::STANDARD_CAN_PACKET_SIZE].copy_from_slice(&buffer[..]);
+
+        for process in self.processes.iter() {
+            let processid = process.processid();
+
+            let result = process.enter(|app, kernel_data| {
+                if !app.receiving {
+                    return None;
+                }
+                // Per-process filter: the device may accept a superset of what
+                // this process asked for.
+                if !app
+                    .subscriptions
+                    .iter()
+                    .flatten()
+                    .any(|s| subscription_matches(s, id))
+                {
+                    return None;
+                }
+                Some(
+                    kernel_data
+                        .get_readwrite_processbuffer(rw_allow::RW_ALLOW_BUFFER)
+                        .map_or_else(
+                            |err| Err(err.into()),
+                            |buffer_ref| {
+                                buffer_ref
+                                    .mut_enter(|user_slice| {
+                                        StreamingProcessSlice::new(user_slice)
+                                            .append_chunk(&chunk)
+                                            .inspect_err(|_| {
+                                                app.lost_messages += 1;
+                                            })
+                                    })
+                                    .unwrap_or_else(|err| Err(err.into()))
+                            },
+                        ),
                 )
+            });
+
+            match result {
+                Some(Ok((_first, new_offset))) => self.upcall(
+                    processid,
+                    up_calls::UPCALL_MESSAGE_RECEIVED,
+                    (0, new_offset as usize, raw_id as usize),
+                ),
+                Some(Err(err)) => self.upcall(
+                    processid,
+                    up_calls::UPCALL_TRANSMISSION_ERROR,
+                    (error_upcalls::ERROR_RX, err as usize, 0),
+                ),
+                None => {}
             }
         }
     }
 
     fn stopped(&self, buffer: &'static mut [u8; can::STANDARD_CAN_PACKET_SIZE]) {
         self.can_rx.replace(buffer);
-        self.schedule_callback(up_calls::UPCALL_RECEIVED_STOPPED, (0, 0, 0));
+        self.hw_receiving.set(false);
+
+        for process in self.processes.iter() {
+            let processid = process.processid();
+            let notify = process.enter(|app, _| !app.receiving);
+            if notify {
+                self.upcall(processid, up_calls::UPCALL_RECEIVED_STOPPED, (0, 0, 0));
+            }
+        }
     }
+}
+
+/// Does `subscription` accept `received`?
+fn subscription_matches(subscription: &Subscription, received: can::Id) -> bool {
+    let (sub_extended, sub_raw) = match subscription.id {
+        can::Id::Standard(v) => (false, v as u32),
+        can::Id::Extended(v) => (true, v),
+    };
+    let (rx_extended, rx_raw) = match received {
+        can::Id::Standard(v) => (false, v as u32),
+        can::Id::Extended(v) => (true, v),
+    };
+    sub_extended == rx_extended && (rx_raw & subscription.mask) == (sub_raw & subscription.mask)
 }

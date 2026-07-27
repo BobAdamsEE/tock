@@ -1342,8 +1342,10 @@ dependencies = [
  "capsules-system",
  "components",
  "cortexm7",
+ "ecdsa-sw",
  "kernel",
  "samv71q21b",
+ "tock-tbf",
  "tock_build_scripts",
 ]
 
