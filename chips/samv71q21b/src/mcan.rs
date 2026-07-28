@@ -81,8 +81,18 @@ const EXT_FILTER_COUNT: usize = 4;
 const RX_FIFO0_COUNT: usize = 32;
 const TX_BUF_COUNT: usize = 4;
 
-// Classic CAN element: 2 header words + 2 data words = 16 bytes
-const CAN_ELEMENT_WORDS: usize = 4;
+// Message RAM element: 2 header words + 16 data words = 72 bytes, sized for a
+// 64-byte CAN FD payload.
+//
+// One element size serves both modes rather than two layouts. RXESC/TXESC
+// configure the element size for the whole peripheral, so it has to be the
+// larger of the two anyway, and a classic frame simply uses a small DLC inside
+// a big element. The cost is message RAM: 32 receive elements go from 512 to
+// 2304 bytes, which is nothing against 384 KB of SRAM, and buys the ability to
+// build a classic kernel and an FD bootloader from the same driver.
+const CAN_ELEMENT_WORDS: usize = 18;
+/// Data bytes an element can hold; also the FD payload ceiling.
+const ELEMENT_DATA_BYTES: usize = (CAN_ELEMENT_WORDS - 2) * 4;
 const STD_FILTER_WORDS: usize = STD_FILTER_COUNT; // 1 word each
 const EXT_FILTER_WORDS: usize = EXT_FILTER_COUNT * 2; // 2 words each
 const FILTER_WORDS: usize = STD_FILTER_WORDS + EXT_FILTER_WORDS;
@@ -98,6 +108,43 @@ const FILTER_WORDS: usize = STD_FILTER_WORDS + EXT_FILTER_WORDS;
 const FILTER_TYPE_CLASSIC: u32 = 0b10; // SFT / EFT: identifier + mask
 const FILTER_CONFIG_FIFO0: u32 = 0b001; // SFEC / EFEC: store in RX FIFO 0
 const FILTER_CONFIG_DISABLED: u32 = 0b000; // SFEC / EFEC: element disabled
+
+/// Payload length a DLC stands for.
+///
+/// Linear to 8, then in jumps: 12, 16, 20, 24, 32, 48, 64. This non-linearity
+/// is the source of most CAN FD framing bugs -- a frame cannot carry, say, 9
+/// bytes, so anything above 8 has to be padded up to the next size that exists.
+fn dlc_to_len(dlc: u32) -> usize {
+    match dlc {
+        0..=8 => dlc as usize,
+        9 => 12,
+        10 => 16,
+        11 => 20,
+        12 => 24,
+        13 => 32,
+        14 => 48,
+        _ => 64,
+    }
+}
+
+/// Smallest DLC that can carry `len` bytes.
+///
+/// Rounds up, so the caller must pad the frame to `dlc_to_len` of the result:
+/// the receiver is told the padded length, not the useful one. Callers that
+/// care about the distinction carry their own length, which is exactly what
+/// ISO-TP's PCI does.
+fn len_to_dlc(len: usize) -> u32 {
+    match len {
+        0..=8 => len as u32,
+        9..=12 => 9,
+        13..=16 => 10,
+        17..=20 => 11,
+        21..=24 => 12,
+        25..=32 => 13,
+        33..=48 => 14,
+        _ => 15,
+    }
+}
 
 const STD_ID_MASK: u32 = 0x7FF;
 const EXT_ID_MASK: u32 = 0x1FFF_FFFF;
@@ -436,6 +483,12 @@ pub struct Mcan {
     automatic_retransmission: Cell<bool>,
     automatic_wake_up: Cell<bool>,
 
+    /// Bit timing for the data phase. Present only when a client has called
+    /// `set_payload_bit_timing`, which is also what puts the peripheral into
+    /// FD mode: there is no separate "enable FD" call in the HIL, and asking
+    /// for a data-phase bit rate is unambiguous about the intent.
+    payload_bit_timing: OptionalCell<can::BitTiming>,
+
     controller_client: OptionalCell<&'static dyn can::ControllerClient>,
     transmit_client:
         OptionalCell<&'static dyn can::TransmitClient<{ can::STANDARD_CAN_PACKET_SIZE }>>,
@@ -444,6 +497,22 @@ pub struct Mcan {
 
     tx_buffer: TakeCell<'static, [u8; can::STANDARD_CAN_PACKET_SIZE]>,
     rx_buffer: TakeCell<'static, [u8; can::STANDARD_CAN_PACKET_SIZE]>,
+
+    /// The same three cells again for 64-byte clients.
+    ///
+    /// Duplicated rather than made generic because `Mcan` appears as a
+    /// concrete type in the chip's peripherals struct and in every board that
+    /// uses it; parameterising it on the payload size would ripple through all
+    /// of them. Only one set is ever live -- a classic kernel registers the
+    /// 8-byte clients, an FD bootloader the 64-byte ones -- so the unused pair
+    /// costs a few pointers of static and nothing at run time.
+    transmit_client_fd:
+        OptionalCell<&'static dyn can::TransmitClient<{ can::FD_CAN_PACKET_SIZE }>>,
+    receive_client_fd:
+        OptionalCell<&'static dyn can::ReceiveClient<{ can::FD_CAN_PACKET_SIZE }>>,
+
+    tx_buffer_fd: TakeCell<'static, [u8; can::FD_CAN_PACKET_SIZE]>,
+    rx_buffer_fd: TakeCell<'static, [u8; can::FD_CAN_PACKET_SIZE]>,
 
     /// Shadow copy of the filter elements, laid out exactly as the filter
     /// region of message RAM.
@@ -471,11 +540,16 @@ impl Mcan {
             operating_mode: OptionalCell::empty(),
             automatic_retransmission: Cell::new(false),
             automatic_wake_up: Cell::new(false),
+            payload_bit_timing: OptionalCell::empty(),
             controller_client: OptionalCell::empty(),
             transmit_client: OptionalCell::empty(),
             receive_client: OptionalCell::empty(),
             tx_buffer: TakeCell::empty(),
             rx_buffer: TakeCell::empty(),
+            transmit_client_fd: OptionalCell::empty(),
+            receive_client_fd: OptionalCell::empty(),
+            tx_buffer_fd: TakeCell::empty(),
+            rx_buffer_fd: TakeCell::empty(),
             filters: [const { Cell::new(0) }; FILTER_WORDS],
             deferred_call: DeferredCall::new(),
             deferred_action: OptionalCell::empty(),
@@ -493,11 +567,16 @@ impl Mcan {
             operating_mode: OptionalCell::empty(),
             automatic_retransmission: Cell::new(false),
             automatic_wake_up: Cell::new(false),
+            payload_bit_timing: OptionalCell::empty(),
             controller_client: OptionalCell::empty(),
             transmit_client: OptionalCell::empty(),
             receive_client: OptionalCell::empty(),
             tx_buffer: TakeCell::empty(),
             rx_buffer: TakeCell::empty(),
+            transmit_client_fd: OptionalCell::empty(),
+            receive_client_fd: OptionalCell::empty(),
+            tx_buffer_fd: TakeCell::empty(),
+            rx_buffer_fd: TakeCell::empty(),
             filters: [const { Cell::new(0) }; FILTER_WORDS],
             deferred_call: DeferredCall::new(),
             deferred_action: OptionalCell::empty(),
@@ -622,8 +701,28 @@ impl Mcan {
                 + NBTP::NTSEG2.val(timing.segment2 as u32),
         );
 
-        // Classic CAN only — no FD
-        self.regs.cccr.modify(CCCR::FDOE::CLEAR + CCCR::BRSE::CLEAR);
+        // CAN FD is enabled only when a client has asked for a data-phase bit
+        // rate. Without that there is nothing to switch to, and a peripheral
+        // advertising FD support it cannot time would be worse than one that
+        // simply speaks classic.
+        match self.payload_bit_timing.get() {
+            Some(data_timing) => {
+                self.regs.dbtp.write(
+                    DBTP::DSJW.val(data_timing.sync_jump_width)
+                        + DBTP::DBRP.val(data_timing.baud_rate_prescaler)
+                        + DBTP::DTSEG1.val(data_timing.segment1 as u32)
+                        + DBTP::DTSEG2.val(data_timing.segment2 as u32),
+                );
+                // FDOE lets FD frames be received; BRSE additionally allows the
+                // faster data phase. Both are needed for the throughput -- FDOE
+                // alone gives 64-byte payloads still clocked at the arbitration
+                // rate, which is a fraction of the gain.
+                self.regs.cccr.modify(CCCR::FDOE::SET + CCCR::BRSE::SET);
+            }
+            None => {
+                self.regs.cccr.modify(CCCR::FDOE::CLEAR + CCCR::BRSE::CLEAR);
+            }
+        }
 
         // Automatic retransmission: DAR=1 disables auto-retransmit
         if self.automatic_retransmission.get() {
@@ -756,8 +855,20 @@ impl Mcan {
         );
 
         // Element sizes: 8-byte data field for classic CAN (RBDS/FEDS = 0)
-        self.regs.rxesc.set(0);
-        self.regs.txesc.set(0);
+        // Element data size: 7 = 64 bytes, for both receive FIFOs, the
+        // dedicated receive buffer and the transmit buffers. This must agree
+        // with CAN_ELEMENT_WORDS or the hardware and the software will disagree
+        // about where each element starts, which presents as data appearing at
+        // the wrong offsets rather than as an error.
+        //
+        // Set unconditionally, not only in FD mode: the element layout is a
+        // property of message RAM, and a classic frame is simply a small DLC
+        // inside a large element.
+        const ESC_64_BYTES: u32 = 7;
+        self.regs
+            .rxesc
+            .set(ESC_64_BYTES | (ESC_64_BYTES << 4) | (ESC_64_BYTES << 8));
+        self.regs.txesc.set(ESC_64_BYTES);
 
         // Extended ID AND Mask, applied to every received extended identifier
         // before it is compared against the extended filter elements. All-ones
@@ -815,15 +926,32 @@ impl Mcan {
     }
 
     /// Write a frame into a TX buffer and request transmission.
-    fn send_frame(
-        &self,
-        id: can::Id,
-        data: &[u8; can::STANDARD_CAN_PACKET_SIZE],
-        len: usize,
-    ) -> Result<(), ErrorCode> {
+    /// Write one frame into a free transmit buffer and request transmission.
+    ///
+    /// Takes a slice rather than a fixed array so that the 8-byte and 64-byte
+    /// `Transmit` implementations share this, which is the only place that
+    /// understands the element layout.
+    ///
+    /// `len` above 8 implies a CAN FD frame. Because DLC is not linear above 8
+    /// (see `len_to_dlc`), the frame on the wire may be longer than `len`: the
+    /// remainder is padding, and the receiver has no way to tell it from
+    /// payload. Callers that need an exact length carry it themselves, which is
+    /// what ISO-TP's PCI does.
+    fn send_frame(&self, id: can::Id, data: &[u8], len: usize) -> Result<(), ErrorCode> {
+        let len = len.min(data.len()).min(ELEMENT_DATA_BYTES);
+
+        // A frame longer than 8 bytes can only go out as FD, and only if the
+        // data phase was configured. Refusing is better than silently
+        // truncating to 8, which would corrupt a transfer rather than fail it.
+        let fd = len > can::STANDARD_CAN_PACKET_SIZE;
+        if fd && self.payload_bit_timing.get().is_none() {
+            return Err(ErrorCode::INVAL);
+        }
+
         let buf_idx = self.find_free_tx_buf().ok_or(ErrorCode::BUSY)?;
 
-        let dlc = if len > 8 { 8 } else { len };
+        let dlc = len_to_dlc(len);
+        let padded = dlc_to_len(dlc);
 
         // Build TX element header words
         let (w0, w1);
@@ -837,8 +965,13 @@ impl Mcan {
                 w0 = (eid & 0x1FFF_FFFF) | (1 << 30);
             }
         }
-        // W1: bits 19:16 = DLC, bit 21 = FDF (0 for classic), bit 20 = BRS (0)
-        w1 = (dlc as u32) << 16;
+        // W1: bits 19:16 = DLC, bit 20 = BRS, bit 21 = FDF.
+        //
+        // FDF makes it an FD frame; BRS additionally switches to the data-phase
+        // bit rate for the payload. Setting FDF without BRS is legal and gives
+        // 64-byte frames at the arbitration rate -- correct, but it throws away
+        // most of the speed, so both go together here.
+        w1 = (dlc << 16) | if fd { (1 << 21) | (1 << 20) } else { 0 };
 
         let elem_base = TX_BUF_OFFSET + buf_idx * CAN_ELEMENT_WORDS;
 
@@ -846,20 +979,24 @@ impl Mcan {
             ram.words[elem_base] = w0;
             ram.words[elem_base + 1] = w1;
 
-            // Pack data bytes into words 2 and 3.
-            // SAMV71 MCAN uses little-endian message RAM: data[0] at
-            // bits [7:0] of the first data word.
-            let mut d0: u32 = 0;
-            let mut d1: u32 = 0;
-            for i in 0..dlc {
-                if i < 4 {
-                    d0 |= (data[i] as u32) << (i * 8);
-                } else {
-                    d1 |= (data[i] as u32) << ((i - 4) * 8);
+            // Pack the payload into the data words. SAMV71 MCAN message RAM is
+            // little-endian: data[0] occupies bits [7:0] of the first data word.
+            //
+            // Bytes between `len` and `padded` are left zero. They are on the
+            // wire either way because DLC cannot express `len` exactly; zeroing
+            // is preferable to leaking whatever the previous frame left in this
+            // element.
+            for w in 0..(CAN_ELEMENT_WORDS - 2) {
+                let mut word: u32 = 0;
+                for b in 0..4 {
+                    let i = w * 4 + b;
+                    if i < len {
+                        word |= (data[i] as u32) << (b * 8);
+                    }
                 }
+                ram.words[elem_base + 2 + w] = word;
             }
-            ram.words[elem_base + 2] = d0;
-            ram.words[elem_base + 3] = d1;
+            let _ = padded;
         });
 
         // Clean D-Cache for the TX element so the MCAN DMA reads
@@ -896,11 +1033,7 @@ impl Mcan {
         // the failure is silent.
         if ir.is_set(IR::TCF) {
             self.regs.ir.write(IR::TCF::SET);
-            self.transmit_client.map(|client| {
-                if let Some(buf) = self.tx_buffer.take() {
-                    client.transmit_complete(Err(can::Error::SetBySoftware), buf);
-                }
-            });
+            self.finish_transmit(Err(can::Error::SetBySoftware));
         }
 
         // RX FIFO 0 new message
@@ -984,11 +1117,7 @@ impl Mcan {
             // Unblock any pending TX: DAR=1 already cleared TXBRP so there
             // will be no TC interrupt.  Return the buffer now so the app's
             // yield_for can complete.
-            self.transmit_client.map(|client| {
-                if let Some(buf) = self.tx_buffer.take() {
-                    client.transmit_complete(Err(err), buf);
-                }
-            });
+            self.finish_transmit(Err(err));
         }
     }
 
@@ -1015,11 +1144,28 @@ impl Mcan {
             }
         }
 
-        self.transmit_client.map(|client| {
-            if let Some(buf) = self.tx_buffer.take() {
-                client.transmit_complete(Ok(()), buf);
-            }
-        });
+        self.finish_transmit(Ok(()));
+    }
+
+    /// Hand the transmit buffer back to whichever width of client owns it.
+    ///
+    /// Only one is ever registered -- a classic kernel takes the 8-byte trait,
+    /// an FD bootloader the 64-byte one -- but every completion path has to
+    /// check both, so they all come through here rather than each guessing.
+    fn finish_transmit(&self, status: Result<(), can::Error>) {
+        if self.transmit_client_fd.is_some() {
+            self.transmit_client_fd.map(|client| {
+                if let Some(buf) = self.tx_buffer_fd.take() {
+                    client.transmit_complete(status, buf);
+                }
+            });
+        } else {
+            self.transmit_client.map(|client| {
+                if let Some(buf) = self.tx_buffer.take() {
+                    client.transmit_complete(status, buf);
+                }
+            });
+        }
     }
 
     /// Process a single element from RX FIFO 0.
@@ -1046,14 +1192,12 @@ impl Mcan {
         Self::dcache_invalidate(inv_addr, CAN_ELEMENT_WORDS * 4);
 
         let mut frame_id = can::Id::Standard(0);
-        let mut frame_data = [0u8; can::STANDARD_CAN_PACKET_SIZE];
+        let mut frame_data = [0u8; can::FD_CAN_PACKET_SIZE];
         let mut frame_len: usize = 0;
 
         self.msg_ram.map(|ram| {
             let w0 = ram.words[elem_base];
             let w1 = ram.words[elem_base + 1];
-            let d0 = ram.words[elem_base + 2];
-            let d1 = ram.words[elem_base + 3];
 
             let xtd = (w0 >> 30) & 1;
             if xtd == 0 {
@@ -1062,16 +1206,15 @@ impl Mcan {
                 frame_id = can::Id::Extended(w0 & 0x1FFF_FFFF);
             }
 
-            let dlc = ((w1 >> 16) & 0xF) as usize;
-            frame_len = if dlc > 8 { 8 } else { dlc };
+            // DLC is the padded length, which is what actually arrived. Any
+            // trailing padding is the sender's business to describe -- ISO-TP
+            // carries its own length and ignores the rest.
+            frame_len = dlc_to_len((w1 >> 16) & 0xF).min(ELEMENT_DATA_BYTES);
 
-            // Unpack data (little-endian: byte 0 at bits [7:0])
+            // Unpack (little-endian: byte 0 at bits [7:0] of the first word).
             for i in 0..frame_len {
-                if i < 4 {
-                    frame_data[i] = ((d0 >> (i * 8)) & 0xFF) as u8;
-                } else {
-                    frame_data[i] = ((d1 >> ((i - 4) * 8)) & 0xFF) as u8;
-                }
+                let word = ram.words[elem_base + 2 + i / 4];
+                frame_data[i] = ((word >> ((i % 4) * 8)) & 0xFF) as u8;
             }
         });
 
@@ -1080,9 +1223,27 @@ impl Mcan {
             .rxf0a
             .write(RXF0A::F0AI.val(get_idx as u32));
 
-        self.receive_client.map(|client| {
-            client.message_received(frame_id, &mut frame_data, frame_len, Ok(()));
-        });
+        // Dispatch to whichever width of client is registered. Only one ever
+        // is: a classic kernel takes the 8-byte trait, an FD bootloader the
+        // 64-byte one.
+        if self.receive_client_fd.is_some() {
+            self.receive_client_fd.map(|client| {
+                client.message_received(frame_id, &mut frame_data, frame_len, Ok(()));
+            });
+        } else {
+            // A classic client cannot be handed more than 8 bytes. With FDOE
+            // clear the hardware will not accept a longer frame anyway, so this
+            // only bites if FD was configured and a classic client registered --
+            // dropping the frame is the honest response, since truncating it
+            // would corrupt a transfer while looking like success.
+            if frame_len <= can::STANDARD_CAN_PACKET_SIZE {
+                let mut short = [0u8; can::STANDARD_CAN_PACKET_SIZE];
+                short[..frame_len].copy_from_slice(&frame_data[..frame_len]);
+                self.receive_client.map(|client| {
+                    client.message_received(frame_id, &mut short, frame_len, Ok(()));
+                });
+            }
+        }
 
         true
     }
@@ -1421,6 +1582,112 @@ impl Mcan {
             ram.words[word] = w0;
         });
         self.clean_filter_region();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CAN FD
+// ---------------------------------------------------------------------------
+
+/// Configuring a data-phase bit rate is what puts the peripheral into FD mode.
+///
+/// There is no separate "enable FD" in the HIL, and inferring it from a bit
+/// rate is not a stretch: a data phase only exists in FD, so asking for one is
+/// unambiguous. `enable()` reads this back and sets `CCCR.FDOE`/`BRSE`
+/// accordingly, so the order of `set_payload_bit_timing` and `enable` does not
+/// matter — the same property the filters already have.
+impl can::ConfigureFd for Mcan {
+    fn set_payload_bit_timing(&self, payload_bit_timing: can::BitTiming) -> Result<(), ErrorCode> {
+        self.payload_bit_timing.set(payload_bit_timing);
+        Ok(())
+    }
+
+    fn get_payload_bit_timing(&self) -> Result<can::BitTiming, ErrorCode> {
+        self.payload_bit_timing.get().ok_or(ErrorCode::INVAL)
+    }
+
+    fn get_frame_size() -> usize {
+        can::FD_CAN_PACKET_SIZE
+    }
+}
+
+impl can::Transmit<{ can::FD_CAN_PACKET_SIZE }> for Mcan {
+    fn set_client(
+        &self,
+        client: Option<&'static dyn can::TransmitClient<{ can::FD_CAN_PACKET_SIZE }>>,
+    ) {
+        if let Some(c) = client {
+            self.transmit_client_fd.set(c);
+        } else {
+            self.transmit_client_fd.clear();
+        }
+    }
+
+    fn send(
+        &self,
+        id: can::Id,
+        buffer: &'static mut [u8; can::FD_CAN_PACKET_SIZE],
+        len: usize,
+    ) -> Result<(), (ErrorCode, &'static mut [u8; can::FD_CAN_PACKET_SIZE])> {
+        match self.state.get() {
+            McanState::Running | McanState::Error(_) => match self.send_frame(id, buffer, len) {
+                Ok(()) => {
+                    self.tx_buffer_fd.replace(buffer);
+                    Ok(())
+                }
+                Err(e) => Err((e, buffer)),
+            },
+            McanState::Disabled => Err((ErrorCode::OFF, buffer)),
+        }
+    }
+}
+
+impl can::Receive<{ can::FD_CAN_PACKET_SIZE }> for Mcan {
+    fn set_client(
+        &self,
+        client: Option<&'static dyn can::ReceiveClient<{ can::FD_CAN_PACKET_SIZE }>>,
+    ) {
+        if let Some(c) = client {
+            self.receive_client_fd.set(c);
+        } else {
+            self.receive_client_fd.clear();
+        }
+    }
+
+    fn start_receive_process(
+        &self,
+        buffer: &'static mut [u8; can::FD_CAN_PACKET_SIZE],
+    ) -> Result<(), (ErrorCode, &'static mut [u8; can::FD_CAN_PACKET_SIZE])> {
+        match self.state.get() {
+            McanState::Running | McanState::Error(_) => {
+                self.rx_buffer_fd.put(Some(buffer));
+                // As in the classic implementation, this is what actually
+                // enables the FIFO interrupt. Without it frames accumulate in
+                // the FIFO and are never delivered, while every register reads
+                // healthy.
+                self.regs.ie.modify(IE::RF0NE::SET + IE::RF0LE::SET);
+                Ok(())
+            }
+            McanState::Disabled => Err((ErrorCode::OFF, buffer)),
+        }
+    }
+
+    fn stop_receive(&self) -> Result<(), ErrorCode> {
+        match self.state.get() {
+            McanState::Running | McanState::Error(_) => {
+                if self.deferred_action.is_some() {
+                    return Err(ErrorCode::BUSY);
+                }
+                if self.rx_buffer_fd.is_none() {
+                    return Err(ErrorCode::ALREADY);
+                }
+                self.regs.ie.modify(IE::RF0NE::CLEAR + IE::RF0LE::CLEAR);
+                self.deferred_action.set(AsyncAction::AbortReceive);
+                self.deferred_call.set();
+                Ok(())
+            }
+            McanState::Disabled => Err(ErrorCode::OFF),
+        }
     }
 }
 
