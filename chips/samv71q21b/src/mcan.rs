@@ -1168,15 +1168,77 @@ impl Mcan {
         }
     }
 
+    /// Bring the controller up without waiting for a deferred call.
+    ///
+    /// `Controller::enable` reports completion through a deferred call, which
+    /// is only serviced once the kernel loop is running. A bootloader that
+    /// wants to listen on the bus *before* deciding whether to start a kernel
+    /// has no kernel loop yet, so it needs the synchronous half on its own.
+    /// Pair with `hw_disable_blocking` before handing the peripheral on.
+    pub fn hw_enable_blocking(&self) -> Result<(), ErrorCode> {
+        if self.bit_timing.is_none() || self.operating_mode.is_none() {
+            return Err(ErrorCode::INVAL);
+        }
+        let result = self.hw_enable();
+        if result.is_ok() {
+            self.state.set(McanState::Running);
+        }
+        result
+    }
+
+    /// Return the controller to init mode, interrupts off.
+    ///
+    /// Leaves it as the reset state left it, so whatever runs next -- a kernel
+    /// with its own driver, most likely -- can configure it from scratch.
+    pub fn hw_disable_blocking(&self) {
+        self.hw_disable();
+    }
+
+    /// Take one frame from RX FIFO 0, or `None` if it is empty.
+    ///
+    /// The polled counterpart to the interrupt-driven receive path, for the
+    /// same pre-kernel-loop callers as `hw_enable_blocking`: no interrupt is
+    /// serviced there, so `message_received` would never fire. Reception into
+    /// the FIFO does not depend on interrupts being enabled, only on the
+    /// filters, so polling sees exactly what the callback path would have.
+    pub fn poll_receive(&self) -> Option<(can::Id, [u8; can::FD_CAN_PACKET_SIZE], usize)> {
+        self.pop_rx_fifo0()
+    }
+
     /// Process a single element from RX FIFO 0.
     ///
     /// Returns `true` if an element was consumed, so the caller can keep
     /// draining until the FIFO reports empty.
     fn handle_rx_fifo0(&self) -> bool {
+        let (frame_id, mut frame_data, frame_len) = match self.pop_rx_fifo0() {
+            Some(frame) => frame,
+            None => return false,
+        };
+
+        // Dispatch to whichever width of client is registered. Only one ever
+        // is: a classic kernel takes the 8-byte trait, an FD bootloader the
+        // 64-byte one.
+        if self.receive_client_fd.is_some() {
+            self.receive_client_fd.map(|client| {
+                client.message_received(frame_id, &mut frame_data, frame_len, Ok(()));
+            });
+        } else {
+            self.dispatch_classic(frame_id, &mut frame_data, frame_len);
+        }
+        true
+    }
+
+    /// Pop one element from RX FIFO 0 and unpack it.
+    ///
+    /// Split out from `handle_rx_fifo0` so the polled and interrupt-driven
+    /// paths cannot drift apart in how they read the message RAM -- the cache
+    /// maintenance and the DLC handling below are easy to get subtly wrong
+    /// twice.
+    fn pop_rx_fifo0(&self) -> Option<(can::Id, [u8; can::FD_CAN_PACKET_SIZE], usize)> {
         let f0s = self.regs.rxf0s.extract();
         let fill = f0s.read(RXF0S::F0FL);
         if fill == 0 {
-            return false;
+            return None;
         }
 
         let get_idx = f0s.read(RXF0S::F0GI) as usize;
@@ -1223,29 +1285,23 @@ impl Mcan {
             .rxf0a
             .write(RXF0A::F0AI.val(get_idx as u32));
 
-        // Dispatch to whichever width of client is registered. Only one ever
-        // is: a classic kernel takes the 8-byte trait, an FD bootloader the
-        // 64-byte one.
-        if self.receive_client_fd.is_some() {
-            self.receive_client_fd.map(|client| {
-                client.message_received(frame_id, &mut frame_data, frame_len, Ok(()));
-            });
-        } else {
-            // A classic client cannot be handed more than 8 bytes. With FDOE
-            // clear the hardware will not accept a longer frame anyway, so this
-            // only bites if FD was configured and a classic client registered --
-            // dropping the frame is the honest response, since truncating it
-            // would corrupt a transfer while looking like success.
-            if frame_len <= can::STANDARD_CAN_PACKET_SIZE {
-                let mut short = [0u8; can::STANDARD_CAN_PACKET_SIZE];
-                short[..frame_len].copy_from_slice(&frame_data[..frame_len]);
-                self.receive_client.map(|client| {
-                    client.message_received(frame_id, &mut short, frame_len, Ok(()));
-                });
-            }
-        }
+        Some((frame_id, frame_data, frame_len))
+    }
 
-        true
+    /// Hand a frame to a classic-width client.
+    fn dispatch_classic(&self, frame_id: can::Id, frame_data: &mut [u8], frame_len: usize) {
+        // A classic client cannot be handed more than 8 bytes. With FDOE
+        // clear the hardware will not accept a longer frame anyway, so this
+        // only bites if FD was configured and a classic client registered --
+        // dropping the frame is the honest response, since truncating it
+        // would corrupt a transfer while looking like success.
+        if frame_len <= can::STANDARD_CAN_PACKET_SIZE {
+            let mut short = [0u8; can::STANDARD_CAN_PACKET_SIZE];
+            short[..frame_len].copy_from_slice(&frame_data[..frame_len]);
+            self.receive_client.map(|client| {
+                client.message_received(frame_id, &mut short, frame_len, Ok(()));
+            });
+        }
     }
 }
 
