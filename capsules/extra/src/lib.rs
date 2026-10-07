@@ -91,6 +91,7 @@ pub mod read_only_state;
 pub mod rf233;
 pub mod rf233_const;
 pub mod screen;
+pub mod sdmmc;
 pub mod sdcard;
 pub mod servo;
 pub mod seven_segment;

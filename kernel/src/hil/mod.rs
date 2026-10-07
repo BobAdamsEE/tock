@@ -33,6 +33,7 @@ pub mod pwm;
 pub mod radio;
 pub mod rng;
 pub mod screen;
+pub mod sdmmc;
 pub mod sensors;
 pub mod servo;
 pub mod spi;

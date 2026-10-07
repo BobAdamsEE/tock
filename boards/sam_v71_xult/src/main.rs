@@ -1,9 +1,10 @@
 //! Tock kernel for the SAMV71 Xplained Ultra evaluation board.
 //!
 //! - ATSAMV71Q21B, Cortex-M7, 300 MHz / 150 MHz MCK
-//! - Console: USART1 via EDBG CDC (PA21 RXD, PB4 TXD), 115200 baud
+//! - Console: USART1 via EDBG CDC (PA21 RXD, PB4 TXD), 115200 baud, mirrored to SEGGER RTT
 //! - LED0: PA23, LED1: PC9 (active-low)
 //! - Alarm: TC0 channel 0, SLCK @ 32 kHz
+//! - SD card: HSMCI slot A, 4-bit, read-only (PA25-PA31, card detect PD18)
 
 #![no_std]
 #![no_main]
@@ -24,6 +25,7 @@ use capsules_system::scheduler::round_robin::RoundRobinSched;
 use samv71q21b::chip::{Atsamv71q21b, Atsamv71q21bDefaultPeripherals};
 use samv71q21b::gpio::PeripheralFunction;
 mod bl_reboot;
+mod console_tee;
 mod credentials;
 
 use samv71q21b::mcan;
@@ -47,6 +49,12 @@ const NUM_PROCS_USIZE: usize = NUM_PROCS as usize;
 #[no_mangle]
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
+
+/// The SD host, for the type of the userspace driver.
+type SdHost = samv71q21b::hsmci::Hsmci<
+    'static,
+    capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<'static, samv71q21b::tc::Tc<'static>>,
+>;
 
 static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> = None;
 
@@ -85,6 +93,8 @@ struct SamV71Xult {
         'static,
         capsules_core::virtualizers::virtual_can::CanDevice<'static, mcan::Mcan>,
     >,
+    /// SD card, read-only (HSMCI slot A).
+    sdmmc: &'static capsules_extra::sdmmc::SdmmcDriver<'static, SdHost>,
     /// Reboot-into-bootloader driver, restricted to the signed UDS app.
     bl_reboot: &'static bl_reboot::BootloaderReboot<'static>,
     /// Scheduler.
@@ -103,6 +113,7 @@ impl SyscallDriverLookup for SamV71Xult {
             capsules_core::led::DRIVER_NUM => f(Some(self.led)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules_extra::can::DRIVER_NUM => f(Some(self.can)),
+            capsules_extra::sdmmc::DRIVER_NUM => f(Some(self.sdmmc)),
             bl_reboot::DRIVER_NUM => f(Some(self.bl_reboot)),
             _ => f(None),
         }
@@ -285,7 +296,20 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     // Console
     // -----------------------------------------------------------------------
-    let uart_mux = components::console::UartMuxComponent::new(&peripherals.usart1, 115200)
+    // Console and debug!() output go to USART1 and are mirrored to SEGGER RTT,
+    // so they can be read over the J-Link alone when the EDBG USB cable is not
+    // attached (e.g. `JLinkRTTLogger`). Input comes from USART1 only.
+    let rtt_memory = components::segger_rtt::SeggerRttMemoryComponent::new()
+        .finalize(components::segger_rtt_memory_component_static!());
+    let rtt = components::segger_rtt::SeggerRttComponent::new(mux_alarm, rtt_memory)
+        .finalize(components::segger_rtt_component_static!(samv71q21b::tc::Tc));
+    let console_tee = static_init!(
+        console_tee::ConsoleTee<'static>,
+        console_tee::ConsoleTee::new(&peripherals.usart1, rtt)
+    );
+    hil::uart::Transmit::set_transmit_client(rtt, console_tee);
+
+    let uart_mux = components::console::UartMuxComponent::new(console_tee, 115200)
         .finalize(components::uart_mux_component_static!());
 
     let console = components::console::ConsoleComponent::new(
@@ -295,7 +319,8 @@ pub unsafe fn main() {
     )
     .finalize(components::console_component_static!());
 
-    hil::uart::Transmit::set_transmit_client(&peripherals.usart1, uart_mux);
+    hil::uart::Transmit::set_transmit_client(&peripherals.usart1, console_tee);
+    hil::uart::Transmit::set_transmit_client(console_tee, uart_mux);
     hil::uart::Receive::set_receive_client(&peripherals.usart1, uart_mux);
 
     // Debug writer for kernel debug!() output over USART1.
@@ -315,6 +340,53 @@ pub unsafe fn main() {
         kernel::hil::led::LedLow::new(peripherals.pa.pin(23)), // LED0
         kernel::hil::led::LedLow::new(peripherals.pc.pin(9)),  // LED1
     ));
+
+    // -----------------------------------------------------------------------
+    // SD card (HSMCI slot A), read-only
+    // -----------------------------------------------------------------------
+    // PA25 = MCCK (Peripheral D); PA28 = MCCDA, PA30/PA31/PA26/PA27 = MCDA0-3
+    // (Peripheral C); PD18 = card detect, active low. CMD and DAT need
+    // pull-ups; the internal ones are enabled in case the holder has none.
+    pmc::PMC.enable_peripheral_clock(16); // PIOD, for card detect
+    pmc::PMC.enable_peripheral_clock(samv71q21b::hsmci::HSMCI_PID);
+    peripherals.pa.pin(25).select_peripheral(PeripheralFunction::D);
+    for pin in [26, 27, 28, 30, 31] {
+        peripherals.pa.pin(pin).enable_pull_up();
+        peripherals.pa.pin(pin).select_peripheral(PeripheralFunction::C);
+    }
+    let sd_detect = peripherals.pd.pin(18);
+    sd_detect.enable();
+    sd_detect.disable_output();
+    sd_detect.enable_pull_up();
+
+    let sd_alarm = static_init!(
+        capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<'static, samv71q21b::tc::Tc>,
+        capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm::new(mux_alarm)
+    );
+    sd_alarm.setup();
+    let hsmci = static_init!(
+        SdHost,
+        samv71q21b::hsmci::Hsmci::new(sd_alarm, Some(sd_detect))
+    );
+    hil::time::Alarm::set_alarm_client(sd_alarm, hsmci);
+    kernel::deferred_call::DeferredCallClient::register(hsmci);
+
+    // Up to 64 blocks (32 KiB) per read. Each read command costs the card
+    // milliseconds of access latency, so few large reads beat many small
+    // ones; the driver drains them in short chunks, so size costs no latency.
+    let sd_buf = static_init!([u8; 64 * hil::sdmmc::BLOCK_SIZE], [0; 64 * hil::sdmmc::BLOCK_SIZE]);
+    let sdmmc = static_init!(
+        capsules_extra::sdmmc::SdmmcDriver<'static, SdHost>,
+        capsules_extra::sdmmc::SdmmcDriver::new(
+            hsmci,
+            sd_buf,
+            board_kernel.create_grant(
+                capsules_extra::sdmmc::DRIVER_NUM,
+                &create_capability!(capabilities::MemoryAllocationCapability)
+            )
+        )
+    );
+    hil::sdmmc::Sdmmc::set_client(hsmci, sdmmc);
 
     // -----------------------------------------------------------------------
     // I2C bus (TWIHS0) + AT24MAC402 EEPROM
@@ -438,6 +510,7 @@ pub unsafe fn main() {
         led,
         alarm,
         can,
+        sdmmc,
         bl_reboot,
         scheduler,
         systick: cortexm7::systick::SysTick::new_with_calibration(300_000_000),

@@ -15,6 +15,7 @@ capsules-extra = { path = "../../capsules/extra" }
 capsules-system = { path = "../../capsules/system" }
 ecdsa-sw = { path = "../../capsules/ecdsa_sw" }
 tock-tbf = { path = "../../libraries/tock-tbf" }
+segger = { path = "../../chips/segger" }
 
 [build-dependencies]
 tock_build_scripts = { path = "../build_scripts" }
