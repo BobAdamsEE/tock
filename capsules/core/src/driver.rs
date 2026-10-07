@@ -62,6 +62,7 @@ pub enum NUM {
     SdCard                = 0x50002,
     Kv                    = 0x50003,
     IsolatedNvmStorage    = 0x50004,
+    Sdmmc                 = 0x50005,
 
     // Sensors
     Temperature           = 0x60000,

@@ -13,6 +13,7 @@ pub mod chip;
 pub mod efc;
 pub mod gpio;
 pub mod gpbr;
+pub mod hsmci;
 pub mod mcan;
 pub mod nvic;
 pub mod pmc;

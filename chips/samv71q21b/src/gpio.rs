@@ -3629,6 +3629,10 @@ impl<'a> PortD<'a> {
         })
     }
 
+    pub fn pin(&self, pin: usize) -> &GPIOPin<'a> {
+        &self.0.pins[pin]
+    }
+
     pub fn handle_interrupt(&self) {
         self.0.handle_interrupt();
     }

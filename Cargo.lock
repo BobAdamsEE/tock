@@ -1345,6 +1345,7 @@ dependencies = [
  "ecdsa-sw",
  "kernel",
  "samv71q21b",
+ "segger",
  "tock-tbf",
  "tock_build_scripts",
 ]
