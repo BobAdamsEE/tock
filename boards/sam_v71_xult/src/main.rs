@@ -42,6 +42,12 @@ use samv71q21b::twihs;
 /// the header the name lives in.
 const PRIVILEGED_APP_NAME: &str = "uds";
 
+/// Console baud rate. 115200 normally; the `fast_console` feature selects
+/// 921600 for bulk transfers over the EDBG virtual COM port, such as pulling
+/// sectors off a failing SD card with the sd_dump application. The bootloader
+/// and the panic handler keep their own 115200.
+const CONSOLE_BAUD: u32 = if cfg!(feature = "fast_console") { 921_600 } else { 115_200 };
+
 const NUM_PROCS: u8 = 4;
 const NUM_PROCS_USIZE: usize = NUM_PROCS as usize;
 
@@ -309,7 +315,13 @@ pub unsafe fn main() {
     );
     hil::uart::Transmit::set_transmit_client(rtt, console_tee);
 
-    let uart_mux = components::console::UartMuxComponent::new(console_tee, 115200)
+    // The fast console goes straight to USART1, without the RTT mirror: the
+    // console writes in small chunks, and the tee holds each one for RTT's
+    // 1 ms completion alarm -- invisible at 115200, but at 921600 it capped
+    // throughput at about a third of the line rate.
+    let console_uart: &'static dyn hil::uart::Uart<'static> =
+        if cfg!(feature = "fast_console") { &peripherals.usart1 } else { console_tee };
+    let uart_mux = components::console::UartMuxComponent::new(console_uart, CONSOLE_BAUD)
         .finalize(components::uart_mux_component_static!());
 
     let console = components::console::ConsoleComponent::new(
@@ -319,8 +331,12 @@ pub unsafe fn main() {
     )
     .finalize(components::console_component_static!());
 
-    hil::uart::Transmit::set_transmit_client(&peripherals.usart1, console_tee);
-    hil::uart::Transmit::set_transmit_client(console_tee, uart_mux);
+    if cfg!(feature = "fast_console") {
+        hil::uart::Transmit::set_transmit_client(&peripherals.usart1, uart_mux);
+    } else {
+        hil::uart::Transmit::set_transmit_client(&peripherals.usart1, console_tee);
+        hil::uart::Transmit::set_transmit_client(console_tee, uart_mux);
+    }
     hil::uart::Receive::set_receive_client(&peripherals.usart1, uart_mux);
 
     // Debug writer for kernel debug!() output over USART1.

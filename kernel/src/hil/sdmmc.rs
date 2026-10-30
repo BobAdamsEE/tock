@@ -56,6 +56,9 @@ pub struct CardInfo {
     /// `switch_status` was read successfully. False on cards without
     /// command class 10, which have no CMD6.
     pub switch_valid: bool,
+    /// 4-bit transfers failed and 1-bit ones worked, so the host fell back to
+    /// a 1-bit bus: a contact or card fault on DAT1-3.
+    pub bus_fallback: bool,
 }
 
 // Written out because `Default` is not derived for arrays longer than 32.
@@ -76,8 +79,46 @@ impl Default for CardInfo {
             ssr_valid: false,
             switch_status: [0; 64],
             switch_valid: false,
+            bus_fallback: false,
         }
     }
+}
+
+/// Where an operation failed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(u8)]
+pub enum ErrorStage {
+    /// No failure recorded.
+    #[default]
+    None = 0,
+    /// The command's response: timeout, CRC, index, end bit.
+    Response = 1,
+    /// The card answered but its R1 status reports an error.
+    CardStatus = 2,
+    /// The data phase: data timeout, data CRC, overrun.
+    Data = 3,
+    /// Waiting for the card to release DAT0 after a busy command.
+    Busy = 4,
+    /// The controller never reported completion at all.
+    Stuck = 5,
+}
+
+/// Diagnostics for the most recent failed operation, so that "the read
+/// failed" can be told apart from "the card is not answering" or "the data
+/// lines are bad". Raw values, to be decoded against the controller's status
+/// register and the SD R1 card-status bits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ErrorInfo {
+    /// Command index that failed (e.g. 17, 18, 13).
+    pub cmd: u8,
+    pub stage: ErrorStage,
+    /// Host controller status register at the moment of failure.
+    pub sr: u32,
+    /// Last response word, the card's R1 status for R1 commands.
+    pub r1: u32,
+    /// Card state (R1 bits 12:9) from a CMD13 issued after the failure:
+    /// 4 = tran, 5 = data, 6 = rcv, ...; 0xFF if CMD13 itself failed.
+    pub card_state: u8,
 }
 
 /// Callbacks from an SD host.
@@ -118,4 +159,21 @@ pub trait Sdmmc<'a> {
         lba: u32,
         count: u32,
     ) -> Result<(), (ErrorCode, &'static mut [u8])>;
+
+    /// Why the most recent failed operation failed.
+    fn last_error(&self) -> ErrorInfo;
+
+    /// Why the SD Status read during initialization failed, if it did.
+    fn init_error(&self) -> ErrorInfo;
+
+    /// Change the bus width (1 or 4) and card clock of an initialized card,
+    /// for marginal cards or contacts. Returns the clock actually set, which
+    /// never exceeds `clock_hz`. Synchronous; fails with `BUSY` during a read.
+    fn set_bus(&self, width: u8, clock_hz: u32) -> Result<u32, ErrorCode>;
+
+    /// Set the data timeout, in ms (1-1000). The default is the SD
+    /// specification's 100 ms. Shortening it trades the chance of calling a
+    /// slow-but-good block bad for speed on a card with many bad blocks,
+    /// each of which costs a full timeout.
+    fn set_data_timeout(&self, ms: u32) -> Result<(), ErrorCode>;
 }

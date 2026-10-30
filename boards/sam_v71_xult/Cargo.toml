@@ -17,6 +17,10 @@ ecdsa-sw = { path = "../../capsules/ecdsa_sw" }
 tock-tbf = { path = "../../libraries/tock-tbf" }
 segger = { path = "../../chips/segger" }
 
+[features]
+# Console at 921600 baud instead of 115200 (see CONSOLE_BAUD in main.rs).
+fast_console = []
+
 [build-dependencies]
 tock_build_scripts = { path = "../build_scripts" }
 

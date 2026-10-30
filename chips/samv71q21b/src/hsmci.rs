@@ -37,7 +37,7 @@
 use core::cell::Cell;
 
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
-use kernel::hil::sdmmc::{CardInfo, Sdmmc, SdmmcClient, BLOCK_SIZE};
+use kernel::hil::sdmmc::{CardInfo, ErrorInfo, ErrorStage, Sdmmc, SdmmcClient, BLOCK_SIZE};
 use kernel::hil::time::{Alarm, AlarmClient, ConvertTicks};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
@@ -76,9 +76,18 @@ const READ_CHUNK_BLOCKS: u32 = 8;
 
 /// Bound on any single status-polling loop. Hardware timeouts (RTOE, DTOE,
 /// CSTOE) are what normally end a stuck operation; this only guards against
-/// a controller that never raises them. One SR read is tens of ns, so this is
-/// well under a second.
-const POLL_LIMIT: u32 = 10_000_000;
+/// a controller that never raises them, and must outlast them -- at 10 M
+/// iterations it fired before a slow-clock data timeout did, turning a clear
+/// DTOE into an unexplained "stuck". Several seconds at tens of ns a read.
+const POLL_LIMIT: u32 = 100_000_000;
+
+/// Data timeout, whatever the card clock: the SD specification's read
+/// timeout (100 ms; for SDSC, the TAAC/NSAC-derived figure, capped at the
+/// same). A block that takes longer is out of spec, so treating it as bad
+/// loses nothing a compliant host would have got -- and on a card with
+/// thousands of bad blocks every failure costs this much. 250 ms made a
+/// damaged 3 MB photo take ~26 s to check.
+const DATA_TIMEOUT_MS: u32 = 100;
 
 // ---------------------------------------------------------------------------
 // Registers
@@ -135,6 +144,21 @@ const SDCR_BUS_4BIT: u32 = 2 << 6;
 
 // DTOR / CSTOR: largest timeout, 15 x 1048576 card clocks.
 const TIMEOUT_MAX: u32 = 0x7F;
+
+/// DTOR value for a `DATA_TIMEOUT_MS` timeout at card clock `hz`. The
+/// register counts card clocks -- DTOCYC (0-15) times a DTOMUL multiplier --
+/// so a fixed value means a timeout that grows as the clock is lowered.
+fn dtor_for(hz: u32, timeout_ms: u32) -> u32 {
+    const MULT: [u32; 8] = [1, 16, 128, 256, 1024, 4096, 65536, 1048576];
+    let cycles = (hz as u64 * timeout_ms as u64 / 1000) as u32;
+    for (i, &m) in MULT.iter().enumerate() {
+        let cyc = cycles.div_ceil(m);
+        if cyc <= 15 {
+            return ((i as u32) << 4) | cyc.max(1);
+        }
+    }
+    TIMEOUT_MAX
+}
 
 // CFG
 const CFG_FIFOMODE: u32 = 1 << 0;
@@ -222,6 +246,14 @@ const CMD7_SELECT_CARD: u32 = 7;
 const CMD8_SEND_IF_COND: u32 = 8;
 const CMD9_SEND_CSD: u32 = 9;
 const CMD12_STOP_TRANSMISSION: u32 = 12;
+const CMD13_SEND_STATUS: u32 = 13;
+
+/// R1 card-status bits that mean the command did not do what was asked:
+/// OUT_OF_RANGE, ADDRESS_ERROR, BLOCK_LEN_ERROR, ERASE_SEQ_ERROR,
+/// ERASE_PARAM, WP_VIOLATION, LOCK_UNLOCK_FAILED, COM_CRC_ERROR,
+/// ILLEGAL_COMMAND, CARD_ECC_FAILED, CC_ERROR, ERROR. (Bit 25,
+/// CARD_IS_LOCKED, is a state, not an error.)
+const R1_ERRORS: u32 = 0xFDF8_0000;
 const CMD16_SET_BLOCKLEN: u32 = 16;
 const CMD17_READ_SINGLE: u32 = 17;
 const CMD18_READ_MULTIPLE: u32 = 18;
@@ -275,6 +307,16 @@ pub struct Hsmci<'a, A: Alarm<'a>> {
     read_count: Cell<u32>,
     /// Blocks of the current read already drained into `buffer`.
     read_done: Cell<u32>,
+    /// Command currently being issued, for `last_error`.
+    cur_cmd: Cell<u8>,
+    /// Latched 48-bit response; see `command`.
+    last_resp: Cell<u32>,
+    last_error: Cell<ErrorInfo>,
+    /// Data timeout in use; `DATA_TIMEOUT_MS` unless a caller shortened it.
+    timeout_ms: Cell<u32>,
+    /// Why the SD Status read during initialization failed, if it did. Kept
+    /// apart because later reads overwrite `last_error`.
+    init_error: Cell<ErrorInfo>,
 }
 
 impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
@@ -295,7 +337,50 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             buffer: TakeCell::empty(),
             read_count: Cell::new(0),
             read_done: Cell::new(0),
+            cur_cmd: Cell::new(0),
+            last_resp: Cell::new(0),
+            last_error: Cell::new(ErrorInfo::default()),
+            timeout_ms: Cell::new(DATA_TIMEOUT_MS),
+            init_error: Cell::new(ErrorInfo::default()),
         }
+    }
+
+    /// Record why an operation failed, reset the controller, and return the
+    /// error code. The controller is reset because an error leaves it wedged;
+    /// the card's state is left for `recover` to sort out.
+    fn fail(&self, stage: ErrorStage, sr: u32, code: ErrorCode) -> ErrorCode {
+        self.last_error.set(ErrorInfo {
+            cmd: self.cur_cmd.get(),
+            stage,
+            sr,
+            // A failed response was never latched: take what the controller
+            // holds (possibly garbage, but it is what arrived), not the
+            // previous command's.
+            r1: if stage == ErrorStage::Response { self.regs.rspr[0].get() } else { self.last_resp.get() },
+            card_state: 0xFF,
+        });
+        self.soft_reset();
+        code
+    }
+
+    /// After a failed transfer, ask the card where it is (CMD13) and bring it
+    /// back to the transfer state if it is stuck sending data. Records the
+    /// state it was found in. Without this, one failed read can leave the card
+    /// ignoring every later command, which looks exactly like a dead card.
+    fn recover(&self) {
+        let mut err = self.last_error.get();
+        let rca_arg = (self.pending.get().rca as u32) << 16;
+        let saved = self.cur_cmd.get();
+        if self.command(CMD13_SEND_STATUS, rca_arg, Resp::R1).is_ok() {
+            let state = ((self.response() >> 9) & 0xF) as u8;
+            err.card_state = state;
+            // 5 = data (sending), 6 = rcv: still mid-transfer.
+            if state == 5 || state == 6 {
+                let _ = self.command(CMD12_STOP_TRANSMISSION | TRCMD_STOP, 0, Resp::R1b);
+            }
+        }
+        self.cur_cmd.set(saved);
+        self.last_error.set(err);
     }
 
     // ----- low-level helpers ---------------------------------------------
@@ -313,6 +398,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         let (bits, actual) = Self::clock_bits(hz);
         let mr = self.regs.mr.get() & !(0xFF | MR_CLKODD);
         self.regs.mr.set(mr | bits);
+        self.regs.dtor.set(dtor_for(actual, self.timeout_ms.get()));
         actual
     }
 
@@ -359,6 +445,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             self.regs.blkr.set(0);
         }
 
+        self.cur_cmd.set((cmdr & 0x3F) as u8);
         self.regs.argr.set(arg);
         self.regs.cmdr.set(cmdr | resp.rsptyp() | MAXLAT_64);
 
@@ -367,23 +454,24 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         loop {
             let sr = self.regs.sr.get();
             if sr & mask != 0 {
-                self.soft_reset();
-                return Err(if sr & (SR_RTOE | SR_CSTOE) != 0 {
-                    ErrorCode::NOACK
-                } else {
-                    ErrorCode::FAIL
-                });
+                let code = if sr & (SR_RTOE | SR_CSTOE) != 0 { ErrorCode::NOACK } else { ErrorCode::FAIL };
+                return Err(self.fail(ErrorStage::Response, sr, code));
             }
             if sr & SR_CMDRDY != 0 {
                 break;
             }
             n += 1;
             if n > POLL_LIMIT {
-                self.soft_reset();
-                return Err(ErrorCode::FAIL);
+                return Err(self.fail(ErrorStage::Stuck, sr, ErrorCode::FAIL));
             }
         }
 
+        // Latch a 48-bit response now. RSPR is read-to-advance (four reads
+        // walk a 136-bit response), so it must be read exactly once; R2
+        // responses are left for `response_136`.
+        if resp != Resp::R2 && resp != Resp::None {
+            self.last_resp.set(self.regs.rspr[0].get());
+        }
         if resp == Resp::R1b {
             self.wait_not_busy()?;
         }
@@ -399,14 +487,14 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             }
             n += 1;
             if n > POLL_LIMIT {
-                self.soft_reset();
-                return Err(ErrorCode::FAIL);
+                return Err(self.fail(ErrorStage::Busy, sr, ErrorCode::FAIL));
             }
         }
     }
 
+    /// The latched response of the last 48-bit command (R1, R3, R6, R7).
     fn response(&self) -> u32 {
-        self.regs.rspr[0].get()
+        self.last_resp.get()
     }
 
     /// The four words of a 136-bit response, as 16 bytes, MSB first.
@@ -434,13 +522,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
                     break;
                 }
                 if sr & SR_DATA_ERRORS != 0 {
-                    self.soft_reset();
-                    return Err(ErrorCode::FAIL);
+                    return Err(self.fail(ErrorStage::Data, sr, ErrorCode::FAIL));
                 }
                 n += 1;
                 if n > POLL_LIMIT {
-                    self.soft_reset();
-                    return Err(ErrorCode::FAIL);
+                    return Err(self.fail(ErrorStage::Stuck, sr, ErrorCode::FAIL));
                 }
             }
             chunk.copy_from_slice(&self.regs.rdr.get().to_le_bytes());
@@ -453,16 +539,14 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         loop {
             let sr = self.regs.sr.get();
             if sr & SR_DATA_ERRORS != 0 {
-                self.soft_reset();
-                return Err(ErrorCode::FAIL);
+                return Err(self.fail(ErrorStage::Data, sr, ErrorCode::FAIL));
             }
             if sr & SR_XFRDONE != 0 {
                 return Ok(());
             }
             n += 1;
             if n > POLL_LIMIT {
-                self.soft_reset();
-                return Err(ErrorCode::FAIL);
+                return Err(self.fail(ErrorStage::Stuck, sr, ErrorCode::FAIL));
             }
         }
     }
@@ -518,6 +602,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
 
         self.command(CMD3_SEND_RELATIVE_ADDR, 0, Resp::R1)?;
         info.rca = (self.response() >> 16) as u16;
+        self.pending.set(info); // `recover` addresses the card by this RCA
         let rca_arg = (info.rca as u32) << 16;
 
         self.command(CMD9_SEND_CSD, rca_arg, Resp::R2)?;
@@ -535,6 +620,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         let scr_result = self.read_short_block(ACMD51_SEND_SCR, 0, Some(info.rca), &mut info.scr);
         if scr_result.is_err() {
             info.scr = [0; 8];
+            self.recover();
         }
 
         // 4-bit bus, if the SCR says the card supports it (every SD memory
@@ -552,10 +638,35 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
 
         // SD Status (ACMD13): speed class, UHS and video speed grades,
         // application performance class, AU and erase parameters. Sent on the
-        // full data bus, so it comes after the switch to 4 bits.
+        // full data bus, so it comes after the switch to 4 bits -- which also
+        // makes it the first test of DAT1-3.
         info.ssr_valid = self
             .read_short_block(ACMD13_SD_STATUS, 0, Some(info.rca), &mut info.ssr)
             .is_ok();
+        if !info.ssr_valid {
+            self.recover();
+            self.init_error.set(self.last_error.get());
+            // A card whose DAT1-3 do not make contact (worn pads, a poor fit
+            // in the holder) passes everything up to here, then fails every
+            // 4-bit transfer -- which reads exactly like a card full of bad
+            // sectors. If 1-bit works where 4-bit did not, stay at 1 bit.
+            if info.bus_width == 4 && self.app_command(ACMD6_SET_BUS_WIDTH, 0, Resp::R1, info.rca).is_ok() {
+                self.regs.sdcr.set(SDCR_BUS_1BIT);
+                if self.read_short_block(ACMD13_SD_STATUS, 0, Some(info.rca), &mut info.ssr).is_ok() {
+                    info.ssr_valid = true;
+                    info.bus_width = 1;
+                    info.bus_fallback = true;
+                } else {
+                    // Not the bus, then: go back to 4 bits.
+                    self.recover();
+                    if self.app_command(ACMD6_SET_BUS_WIDTH, 2, Resp::R1, info.rca).is_ok() {
+                        self.regs.sdcr.set(SDCR_BUS_4BIT);
+                    } else {
+                        info.bus_width = 1;
+                    }
+                }
+            }
+        }
 
         // CMD6 in mode 0 ("check"): which bus speed modes, command systems,
         // driver strengths and power limits the card supports. Mode 0 only
@@ -567,6 +678,9 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             && self
                 .read_short_block(CMD6_SWITCH_FUNC, CMD6_CHECK_ALL_UNCHANGED, None, &mut info.switch_status)
                 .is_ok();
+        if ccc & (1 << 10) != 0 && !info.switch_valid {
+            self.recover();
+        }
 
         Ok(info)
     }
@@ -635,7 +749,16 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         } else {
             CMD18_READ_MULTIPLE | TRTYP_MULTIPLE
         };
-        self.command(cmd | TRCMD_START | TRDIR_READ, addr, Resp::R1)
+        self.command(cmd | TRCMD_START | TRDIR_READ, addr, Resp::R1)?;
+        // The card accepted the command but may report a problem with it
+        // (address out of range, an ECC failure on the previous read, a
+        // general error). Failing here, rather than waiting for data that
+        // will not come, turns a data timeout into an explained error.
+        let r1 = self.response();
+        if r1 & R1_ERRORS != 0 {
+            return Err(self.fail(ErrorStage::CardStatus, self.regs.sr.get(), ErrorCode::FAIL));
+        }
+        Ok(())
     }
 
     /// Drain up to `READ_CHUNK_BLOCKS` more blocks of the outstanding read.
@@ -656,12 +779,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         Ok(true)
     }
 
-    /// Abandon a multiple-block read after an error. The card stays in data
-    /// state, ignoring every later command, until it sees CMD12.
+    /// Abandon a read after an error. A card mid multiple-block read stays in
+    /// data state, ignoring every later command, until it sees CMD12;
+    /// `recover` checks the state and sends it only when needed.
     fn abort_read(&self) {
-        if self.read_count.get() > 1 {
-            let _ = self.command(CMD12_STOP_TRANSMISSION | TRCMD_STOP, 0, Resp::R1b);
-        }
+        self.recover();
     }
 
     fn finish_read(&self, result: Result<(), ErrorCode>) {
@@ -726,6 +848,52 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
         self.info.get()
     }
 
+    fn last_error(&self) -> ErrorInfo {
+        self.last_error.get()
+    }
+
+    fn init_error(&self) -> ErrorInfo {
+        self.init_error.get()
+    }
+
+    fn set_data_timeout(&self, ms: u32) -> Result<(), ErrorCode> {
+        if ms == 0 || ms > 1000 {
+            return Err(ErrorCode::INVAL);
+        }
+        if self.state.get() == State::Reading {
+            return Err(ErrorCode::BUSY);
+        }
+        self.timeout_ms.set(ms);
+        let hz = self.info.get().map_or(INIT_CLOCK_HZ, |i| i.clock_hz);
+        self.regs.dtor.set(dtor_for(hz, ms));
+        Ok(())
+    }
+
+    fn set_bus(&self, width: u8, clock_hz: u32) -> Result<u32, ErrorCode> {
+        if self.state.get() != State::Ready {
+            return Err(if self.state.get() == State::Off { ErrorCode::OFF } else { ErrorCode::BUSY });
+        }
+        let mut info = self.info.get().ok_or(ErrorCode::OFF)?;
+        if (width != 1 && width != 4) || clock_hz < INIT_CLOCK_HZ || clock_hz > DATA_CLOCK_HZ {
+            return Err(ErrorCode::INVAL);
+        }
+        if width != info.bus_width {
+            // Drop to a safe clock while the card and host disagree.
+            self.set_clock(INIT_CLOCK_HZ);
+            let arg = if width == 4 { 2 } else { 0 };
+            if let Err(e) = self.app_command(ACMD6_SET_BUS_WIDTH, arg, Resp::R1, info.rca) {
+                self.recover();
+                self.set_clock(info.clock_hz);
+                return Err(e);
+            }
+            self.regs.sdcr.set(if width == 4 { SDCR_BUS_4BIT } else { SDCR_BUS_1BIT });
+            info.bus_width = width;
+        }
+        info.clock_hz = self.set_clock(clock_hz);
+        self.info.set(info);
+        Ok(info.clock_hz)
+    }
+
     fn read_blocks(
         &self,
         buffer: &'static mut [u8],
@@ -748,6 +916,7 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
         }
 
         if let Err(e) = self.start_read(lba, count, info.high_capacity) {
+            self.recover();
             return Err((e, buffer));
         }
         self.read_count.set(count);
