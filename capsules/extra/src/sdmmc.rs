@@ -20,6 +20,9 @@
 //! | 3 | `lba`, `count`  | read `count` blocks into RW allow 0; upcall kind 1 |
 //! | 4 |                 | copy `CardInfo` into RW allow 1; returns its length |
 //! | 5 |                 | maximum blocks per read (kernel buffer size / 512) |
+//! | 6 | `which`         | failure diagnostics: 0 last failure, 1 SD Status read at init. Returns `cmd \| stage << 8 \| card_state << 16`, controller SR, R1 |
+//! | 7 | `width`, `hz`   | set bus width (1/4) and clock; returns the clock set |
+//! | 8 | `ms`            | data timeout, 1-1000 ms (default 100, the SD specification's) |
 //!
 //! ### Upcall 0: `(kind, status, value)`
 //!
@@ -36,7 +39,7 @@
 //! | 32 | 8  | SCR, MSB first (zero if unread) |
 //! | 40 | 4  | OCR |
 //! | 44 | 2  | RCA |
-//! | 46 | 1  | flags: bit0 high capacity, bit1 physical layer v2+, bit2 SD Status valid, bit3 CMD6 status valid |
+//! | 46 | 1  | flags: bit0 high capacity, bit1 physical layer v2+, bit2 SD Status valid, bit3 CMD6 status valid, bit4 fell back to a 1-bit bus |
 //! | 47 | 1  | bus width |
 //! | 48 | 4  | capacity in 512-byte blocks |
 //! | 52 | 4  | card clock, Hz |
@@ -120,7 +123,8 @@ fn serialize(info: &CardInfo, out: &mut [u8; CARD_INFO_LEN]) {
     out[46] = (info.high_capacity as u8)
         | ((info.version2 as u8) << 1)
         | ((info.ssr_valid as u8) << 2)
-        | ((info.switch_valid as u8) << 3);
+        | ((info.switch_valid as u8) << 3)
+        | ((info.bus_fallback as u8) << 4);
     out[47] = info.bus_width;
     out[48..52].copy_from_slice(&info.block_count.to_le_bytes());
     out[52..56].copy_from_slice(&info.clock_hz.to_le_bytes());
@@ -223,6 +227,28 @@ impl<'a, S: Sdmmc<'a>> SyscallDriver for SdmmcDriver<'a, S> {
             },
 
             5 => CommandReturn::success_u32(self.max_blocks as u32),
+
+            // Failure diagnostics: arg1 0 = last failed operation, 1 = the SD
+            // Status read during initialization. Returns
+            // (cmd | stage << 8 | card_state << 16, controller SR, R1).
+            6 => {
+                let e = if arg1 == 1 { self.host.init_error() } else { self.host.last_error() };
+                CommandReturn::success_u32_u32_u32(
+                    (e.cmd as u32) | ((e.stage as u32) << 8) | ((e.card_state as u32) << 16),
+                    e.sr,
+                    e.r1,
+                )
+            }
+
+            // Set bus width (arg1: 1 or 4) and clock (arg2, Hz). Returns the
+            // clock actually set.
+            7 => match self.host.set_bus(arg1 as u8, arg2 as u32) {
+                Ok(hz) => CommandReturn::success_u32(hz),
+                Err(e) => CommandReturn::failure(e),
+            },
+
+            // Data timeout in ms (arg1).
+            8 => CommandReturn::from(self.host.set_data_timeout(arg1 as u32)),
 
             _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
         }
