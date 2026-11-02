@@ -166,10 +166,6 @@ impl<'a> time::Time for Tc<'a> {
 // ---------------------------------------------------------------------------
 
 impl<'a> time::Counter<'a> for Tc<'a> {
-    fn set_overflow_client(&self, _client: &'a dyn time::OverflowClient) {
-        // Not used by bootloader; overflow is tracked internally.
-    }
-
     fn start(&self) -> Result<(), ErrorCode> {
         if self.running.get() {
             return Ok(());

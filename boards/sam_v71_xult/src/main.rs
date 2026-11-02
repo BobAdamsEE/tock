@@ -16,6 +16,7 @@ use kernel::capabilities;
 use kernel::component::Component;
 use kernel::hil;
 use kernel::hil::time::Counter;
+use kernel::platform::chip::Chip;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 #[allow(unused_imports)]
 use kernel::{create_capability, debug, static_init};
@@ -199,7 +200,7 @@ pub unsafe fn main() {
     // Flash wait states for 150 MHz (FWS=6). CLOE intentionally OFF.
     core::ptr::write_volatile(0x400E_0C00 as *mut u32, 0x0000_0600);
 
-    samv71q21b::init();
+    <Atsamv71q21b<Atsamv71q21bDefaultPeripherals> as Chip>::init();
 
     // Deferred call state (must be early, before any component that uses it).
     kernel::deferred_call::initialize_deferred_call_state_unsafe::<
@@ -296,6 +297,7 @@ pub unsafe fn main() {
         board_kernel,
         capsules_core::alarm::DRIVER_NUM,
         mux_alarm,
+        create_capability!(capabilities::MemoryAllocationCapability),
     )
     .finalize(components::alarm_component_static!(samv71q21b::tc::Tc));
 
@@ -328,6 +330,7 @@ pub unsafe fn main() {
         board_kernel,
         capsules_core::console::DRIVER_NUM,
         uart_mux,
+        create_capability!(capabilities::MemoryAllocationCapability),
     )
     .finalize(components::console_component_static!());
 
@@ -484,6 +487,7 @@ pub unsafe fn main() {
         board_kernel,
         capsules_extra::can::DRIVER_NUM,
         can_device,
+        create_capability!(capabilities::MemoryAllocationCapability),
     )
     .with_subscriber(can_device)
     .finalize(components::can_component_static!(
@@ -661,6 +665,7 @@ pub unsafe fn main() {
         storage_permissions_policy,
         app_flash,
         app_memory,
+        create_capability!(capabilities::ProcessManagementCapability),
     )
     .finalize(components::process_loader_sequential_component_static!(
         Atsamv71q21b<Atsamv71q21bDefaultPeripherals>,
@@ -742,10 +747,7 @@ pub unsafe fn panic_fmt(pi: &core::panic::PanicInfo) -> ! {
     // Print fault registers saved by hard_fault_handler when a process faulted.
     // SCB_REGISTERS = [CCR, CFSR, HFSR, MMFAR, BFAR] saved at fault time.
     // Only meaningful after "Process X had a fault"; harmless (all zeros) otherwise.
-    extern "C" {
-        static mut SCB_REGISTERS: [u32; 5];
-    }
-    let scb = core::ptr::addr_of!(SCB_REGISTERS);
+    let scb = core::ptr::addr_of!(cortexm::syscall::SCB_REGISTERS) as *const [u32; 5];
     let ccr   = unsafe { (*scb)[0] };
     let cfsr  = unsafe { (*scb)[1] };
     let hfsr  = unsafe { (*scb)[2] };

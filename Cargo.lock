@@ -1587,6 +1587,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "sam_v71_xult"
+version = "0.2.3"
+dependencies = [
+ "capsules-core",
+ "capsules-extra",
+ "capsules-system",
+ "components",
+ "cortexm",
+ "cortexm7",
+ "ecdsa-sw",
+ "kernel",
+ "samv71q21b",
+ "segger",
+ "tock-tbf",
+ "tock_build_scripts",
+]
+
+[[package]]
+name = "samv71q21b"
+version = "0.2.3"
+dependencies = [
+ "cortexm7",
+ "enum_primitive",
+ "kernel",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

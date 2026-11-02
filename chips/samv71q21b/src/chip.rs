@@ -65,7 +65,7 @@ impl Atsamv71q21bDefaultPeripherals {
 }
 
 impl InterruptService for Atsamv71q21bDefaultPeripherals {
-    unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
+    fn service_interrupt(&self, interrupt: u32) -> bool {
         match interrupt {
             nvic::EFC      => self.efc.handle_interrupt(),
             nvic::USART1   => self.usart1.handle_interrupt(),
@@ -94,20 +94,31 @@ impl<I: InterruptService + 'static> Chip for Atsamv71q21b<I> {
     type UserspaceKernelBoundary = cortexm7::syscall::SysCall;
     type ThreadIdProvider = cortexm7::thread_id::CortexMThreadIdProvider;
 
+    fn init() {
+        cortexm7::nvic::disable_all();
+        cortexm7::nvic::clear_all_pending();
+
+        crate::initialize_vector_table();
+
+        // Do NOT call enable_all() here — the bootloader only handles a few
+        // interrupts (USART, EFC, PIOx).  Enabling every NVIC line causes
+        // service_pending_interrupts() to panic on the first unhandled
+        // peripheral (RSTC, SUPC, PMC …).  main.rs enables exactly the
+        // lines it needs.
+    }
+
     fn service_pending_interrupts(&self) {
-        unsafe {
-            while let Some(interrupt) = cortexm7::nvic::next_pending() {
-                let handled = self.interrupt_service.service_interrupt(interrupt);
-                assert!(handled, "Unhandled interrupt number {}", interrupt);
-                let n = cortexm7::nvic::Nvic::new(interrupt);
-                n.clear_pending();
-                n.enable();
-            }
+        while let Some(interrupt) = cortexm7::nvic::next_pending() {
+            let handled = self.interrupt_service.service_interrupt(interrupt);
+            assert!(handled, "Unhandled interrupt number {}", interrupt);
+            let n = cortexm7::nvic::Nvic::new(interrupt);
+            n.clear_pending();
+            n.enable();
         }
     }
 
     fn has_pending_interrupts(&self) -> bool {
-        unsafe { cortexm7::nvic::has_pending() }
+        cortexm7::nvic::has_pending()
     }
 
     fn mpu(&self) -> &cortexm7::mpu::MPU {
@@ -125,7 +136,7 @@ impl<I: InterruptService + 'static> Chip for Atsamv71q21b<I> {
         }
     }
 
-    unsafe fn with_interrupts_disabled<F, R>(&self, f: F) -> R
+    fn with_interrupts_disabled<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
     {

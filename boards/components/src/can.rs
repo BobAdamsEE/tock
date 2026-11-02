@@ -149,7 +149,7 @@ macro_rules! can_mux_component_static {
         let mux = static_buf!(MuxCan<'static, $C>);
         let rx = static_buf!([u8; can::STANDARD_CAN_PACKET_SIZE]);
         (mux, rx)
-    };};
+    }};
 }
 
 #[macro_export]
@@ -160,7 +160,7 @@ macro_rules! can_device_component_static {
         use kernel::static_buf;
 
         static_buf!(CanDevice<'static, $C>)
-    };};
+    }};
 }
 
 pub struct CanMuxComponent<C: 'static + can::Can + can::Filter> {

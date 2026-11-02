@@ -147,15 +147,11 @@ pub static IRQS: [unsafe extern "C" fn(); 74] = [
     CortexM7::GENERIC_ISR, // GMAC Queue 5 (73)
 ];
 
-pub unsafe fn init() {
-    cortexm7::nvic::disable_all();
-    cortexm7::nvic::clear_all_pending();
-
-    cortexm7::scb::set_vector_table_offset(core::ptr::addr_of!(BASE_VECTORS) as *const ());
-
-    // Do NOT call enable_all() here — the bootloader only handles a few
-    // interrupts (USART, EFC, PIOx).  Enabling every NVIC line causes
-    // service_pending_interrupts() to panic on the first unhandled
-    // peripheral (RSTC, SUPC, PMC …).  main.rs enables exactly the
-    // lines it needs.
+pub(crate) fn initialize_vector_table() {
+    // ### Safety
+    //
+    // `BASE_VECTORS` is a valid vector table of the type the core expects.
+    unsafe {
+        cortexm7::scb::set_vector_table_offset(BASE_VECTORS.as_ptr().cast::<()>());
+    }
 }
