@@ -4,8 +4,9 @@
 
 //! Power Management Controller (PMC) for SAMV71Q21B.
 //!
-//! Configures clocks for the SAMV71 Xplained Ultra evaluation board:
-//!   - Attempts external 12 MHz crystal → PLLA ×25 = 300 MHz (PCK)
+//! Configures clocks for boards built around the SAMV71Q21B:
+//!   - Attempts the board's external crystal → PLLA = 300 MHz (PCK)
+//!     (12 MHz × 25 on the Xplained Ultra, 20 MHz × 15 on Chameleon)
 //!   - Falls back to internal RC if crystal does not start
 //!   - MCK (master/peripheral clock) = PCK / 2 = 150 MHz  (MDIV = PCK_DIV2)
 //!
@@ -101,7 +102,7 @@ register_bitfields![u32,
     CkgrPllar [
         /// Must be 1.
         ONE       OFFSET(29) NUMBITS(1) [],
-        /// Multiplier minus 1. Set to 24 for ×25 (300 MHz from 12 MHz).
+        /// Multiplier minus 1: 24 for 300 MHz from 12 MHz, 14 from 20 MHz.
         MULA      OFFSET(16) NUMBITS(11) [],
         /// Lock time in slow-clock cycles. Use 0x3F (maximum) for safety.
         PLLACOUNT OFFSET(8)  NUMBITS(6) [],
@@ -245,19 +246,19 @@ impl Pmc {
             .write(PmcWpmr::WPKEY.val(WP_KEY) + PmcWpmr::WPEN::SET);
     }
 
-    /// Configure clocks for the SAMV71 Xplained Ultra board.
+    /// Configure clocks for 300 MHz PCK and 150 MHz MCK.
     ///
-    /// Tries the external 12 MHz crystal first. If MOSCXTS does not
-    /// go high within the timeout, falls back to the internal RC
-    /// oscillator and adapts the PLLA multiplier to whatever MOSCRCF
-    /// frequency is currently selected.
+    /// Tries the external crystal of `crystal_hz` first; 300 MHz must be an
+    /// integer multiple of it. If MOSCXTS does not go high within the
+    /// timeout, falls back to the internal RC oscillator and adapts the PLLA
+    /// multiplier to whatever MOSCRCF frequency is currently selected.
     ///
     /// After this call:
     ///   - PCK (Cortex-M7 core) = 300 MHz  (296 MHz in 8 MHz RC fallback)
     ///   - MCK (peripheral bus)  = 150 MHz  (148 MHz in 8 MHz RC fallback)
     ///
     /// UART baud rate at MCK ≈ 150 MHz: CD = 81.
-    pub fn setup_clocks(&self) {
+    pub fn setup_clocks(&self, crystal_hz: u32) {
         self.disable_write_protection();
 
         // Park MCK on MAINCK (the internal RC) while reconfiguring PLLA.
@@ -267,7 +268,7 @@ impl Pmc {
         while !self.regs.pmc_sr.is_set(PmcSr::MCKRDY) {}
 
         // ---------------------------------------------------------------
-        // Attempt external 12 MHz crystal startup.
+        // Attempt external crystal startup.
         //
         // Enable the crystal oscillator with maximum startup time:
         // MOSCXTST=255 → (255+1) × 8 slow-clock cycles ≈ 62 ms.
@@ -299,8 +300,8 @@ impl Pmc {
             );
             while !self.regs.pmc_sr.is_set(PmcSr::MOSCSELS) {}
 
-            // 12 MHz × 25 = 300 MHz — deterministic, no MOSCRCF ambiguity.
-            mula = 24;
+            // Deterministic, no MOSCRCF ambiguity.
+            mula = 300_000_000 / crystal_hz - 1;
         } else {
             // Crystal did not start — fall back to internal RC.
             //

@@ -51,6 +51,7 @@ members = [
     "boards/apollo3/lora_things_plus",
     "boards/psc3m5_evk",
     "boards/redboard_redv",
+	"boards/chameleon",
 	"boards/sam_v71_xult",
     "boards/stm32f3discovery",
     "boards/stm32f412gdiscovery",

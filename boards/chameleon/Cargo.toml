@@ -1,0 +1,26 @@
+[package]
+name = "chameleon"
+version.workspace = true
+authors.workspace = true
+build = "../build.rs"
+edition.workspace = true
+
+[dependencies]
+components = { path = "../components" }
+cortexm = { path = "../../arch/cortex-m" }
+cortexm7 = { path = "../../arch/cortex-m7" }
+kernel = { path = "../../kernel" }
+samv71q21b = { path = "../../chips/samv71q21b" }
+capsules-core = { path = "../../capsules/core" }
+capsules-extra = { path = "../../capsules/extra" }
+capsules-system = { path = "../../capsules/system" }
+ecdsa-sw = { path = "../../capsules/ecdsa_sw" }
+tock-tbf = { path = "../../libraries/tock-tbf" }
+segger = { path = "../../chips/segger" }
+
+
+[build-dependencies]
+tock_build_scripts = { path = "../build_scripts" }
+
+[lints]
+workspace = true

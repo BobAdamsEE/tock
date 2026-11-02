@@ -207,7 +207,7 @@ pub unsafe fn main() {
         cortexm7::thread_id::CortexMThreadIdProvider,
     >();
 
-    pmc::PMC.setup_clocks();
+    pmc::PMC.setup_clocks(12_000_000);
 
     let mcan1_msg_ram = static_init!(mcan::MessageRam, mcan::MessageRam::new());
 

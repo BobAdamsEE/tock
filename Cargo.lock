@@ -94,6 +94,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
 
 [[package]]
+name = "chameleon"
+version = "0.2.3"
+dependencies = [
+ "capsules-core",
+ "capsules-extra",
+ "capsules-system",
+ "components",
+ "cortexm",
+ "cortexm7",
+ "ecdsa-sw",
+ "kernel",
+ "samv71q21b",
+ "segger",
+ "tock-tbf",
+ "tock_build_scripts",
+]
+
+[[package]]
 name = "clue_nrf52840"
 version = "0.2.3"
 dependencies = [
