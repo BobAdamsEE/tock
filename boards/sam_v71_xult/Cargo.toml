@@ -21,6 +21,10 @@ segger = { path = "../../chips/segger" }
 [features]
 # Console at 921600 baud instead of 115200 (see CONSOLE_BAUD in main.rs).
 fast_console = []
+# Let applications write to the SD card and issue raw SD commands (the
+# sd_shell app). Off by default: the default kernel cannot alter a card, which
+# is what sd_inspect and sd_dump rely on when examining deleted data.
+sd_write = []
 
 [build-dependencies]
 tock_build_scripts = { path = "../build_scripts" }

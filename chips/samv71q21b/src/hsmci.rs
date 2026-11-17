@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! HSMCI (High Speed MultiMedia Card Interface) SD memory card host for the
-//! SAMV71, implementing the read-only `kernel::hil::sdmmc::Sdmmc` interface.
+//! SAMV71, implementing `kernel::hil::sdmmc::Sdmmc` (read-only) and
+//! `kernel::hil::sdmmc::SdmmcWrite` (writes and raw commands).
 //!
 //! Native SD bus mode, 4 bits wide, 25 MHz default speed. Register map:
 //! SAMV71 datasheet, "High Speed Multimedia Card Interface (HSMCI)".
@@ -19,15 +20,23 @@
 //!
 //! ## Design
 //!
-//! * **Read-only.** No command that writes, erases or locks the card is ever
-//!   issued. The card this was written for holds deleted data that must
-//!   survive inspection, and the strongest guarantee of that is no write path.
+//! * **Read-only unless the board says otherwise.** Through `Sdmmc`, no
+//!   command that writes, erases or locks the card is ever issued: the card
+//!   this was written for holds deleted data that must survive inspection.
+//!   Writes and raw commands exist only through `SdmmcWrite`, which a board
+//!   has to hand to a capsule explicitly.
 //! * **Polled data transfer, no DMA.** The CPU drains `RDR` one word at a
 //!   time with `RDPROOF` set, so the controller stops the card clock rather
 //!   than overrunning if the CPU falls behind. That rules out the D-cache
 //!   coherence problem XDMAC would bring (cf. the MCAN message RAM). Large
 //!   reads are drained `READ_CHUNK_BLOCKS` at a time from successive deferred
 //!   calls, so the kernel is never busy for more than ~0.35 ms at a stretch.
+//!   Writes are filled the same way, with `WRPROOF` holding the clock while
+//!   the FIFO is empty -- except that each block also waits out the card's
+//!   programming busy, typically a millisecond or two.
+//! * **Raw commands run whole in one deferred call.** They are a debugging
+//!   path, so a raw data phase is polled to the end at once; only an R1b busy
+//!   (an erase can hold DAT0 for seconds) is waited out from an alarm.
 //! * **Asynchronous at the HIL.** Completions are delivered from a deferred
 //!   call, never from inside the request, so callers see a normal split-phase
 //!   interface. The one genuinely slow step, waiting for the card to leave
@@ -37,7 +46,10 @@
 use core::cell::Cell;
 
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
-use kernel::hil::sdmmc::{CardInfo, ErrorInfo, ErrorStage, Sdmmc, SdmmcClient, BLOCK_SIZE};
+use kernel::hil::sdmmc::{
+    CardInfo, ErrorInfo, ErrorStage, RawCommand, RawData, RawResponse, RawResult, Sdmmc,
+    SdmmcClient, SdmmcWrite, SdmmcWriteClient, BLOCK_SIZE,
+};
 use kernel::hil::time::{Alarm, AlarmClient, ConvertTicks};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
@@ -89,6 +101,24 @@ const POLL_LIMIT: u32 = 100_000_000;
 /// damaged 3 MB photo take ~26 s to check.
 const DATA_TIMEOUT_MS: u32 = 100;
 
+/// Data timeout while writing: the SD specification's write timeout, 250 ms
+/// for SDSC/SDHC and 500 ms for SDXC. A card may legitimately stay busy this
+/// long after a block, so the read timeout would fail good writes.
+const WRITE_TIMEOUT_MS: u32 = 500;
+
+/// Blocks filled per deferred call while writing; see `READ_CHUNK_BLOCKS`.
+const WRITE_CHUNK_BLOCKS: u32 = 8;
+
+/// Interval between checks of DAT0 while a raw R1b command holds it busy.
+const RAW_BUSY_POLL_MS: u32 = 1;
+
+/// How long a raw R1b command may hold DAT0 busy before it is called stuck.
+/// Generous: erasing a large range is allowed seconds per erase unit.
+const RAW_BUSY_TIMEOUT_MS: u32 = 120_000;
+
+/// Fastest card clock: high speed, which needs CMD6 to switch the card first.
+const HS_CLOCK_HZ: u32 = 50_000_000;
+
 // ---------------------------------------------------------------------------
 // Registers
 // ---------------------------------------------------------------------------
@@ -136,6 +166,9 @@ const CR_SWRST: u32 = 1 << 7;
 const MR_PWSDIV_MAX: u32 = 7 << 8;
 const MR_RDPROOF: u32 = 1 << 11;
 const MR_WRPROOF: u32 = 1 << 12;
+/// Force byte transfer: one data byte per RDR/TDR access, for block lengths
+/// that are not a multiple of 4.
+const MR_FBYTE: u32 = 1 << 13;
 const MR_CLKODD: u32 = 1 << 16;
 
 // SDCR: slot A, SDCBUS in [7:6].
@@ -163,6 +196,7 @@ fn dtor_for(hz: u32, timeout_ms: u32) -> u32 {
 // CFG
 const CFG_FIFOMODE: u32 = 1 << 0;
 const CFG_FERRCTRL: u32 = 1 << 4;
+const CFG_HSMODE: u32 = 1 << 8;
 
 // CMDR fields
 const RSP_NONE: u32 = 0 << 6;
@@ -180,6 +214,7 @@ const TRTYP_MULTIPLE: u32 = 1 << 19;
 // SR
 const SR_CMDRDY: u32 = 1 << 0;
 const SR_RXRDY: u32 = 1 << 1;
+const SR_TXRDY: u32 = 1 << 2;
 const SR_NOTBUSY: u32 = 1 << 5;
 const SR_DTIP: u32 = 1 << 4;
 const SR_RINDE: u32 = 1 << 16;
@@ -257,6 +292,8 @@ const R1_ERRORS: u32 = 0xFDF8_0000;
 const CMD16_SET_BLOCKLEN: u32 = 16;
 const CMD17_READ_SINGLE: u32 = 17;
 const CMD18_READ_MULTIPLE: u32 = 18;
+const CMD24_WRITE_SINGLE: u32 = 24;
+const CMD25_WRITE_MULTIPLE: u32 = 25;
 const ACMD41_SD_SEND_OP_COND: u32 = 41;
 const ACMD51_SEND_SCR: u32 = 51;
 const CMD55_APP_CMD: u32 = 55;
@@ -288,6 +325,13 @@ enum State {
     /// A read command is outstanding; the deferred call drains it a chunk
     /// at a time.
     Reading,
+    /// A write command is outstanding; the deferred call fills it a chunk
+    /// at a time.
+    Writing,
+    /// A raw command waits for the deferred call to issue it.
+    Raw,
+    /// A raw R1b command was issued; the alarm polls until DAT0 is released.
+    RawBusy,
 }
 
 /// SAMV71 HSMCI SD host.
@@ -296,6 +340,7 @@ pub struct Hsmci<'a, A: Alarm<'a>> {
     alarm: &'a A,
     card_detect: Option<&'a GPIOPin<'a>>,
     client: OptionalCell<&'a dyn SdmmcClient>,
+    write_client: OptionalCell<&'a dyn SdmmcWriteClient>,
     deferred_call: DeferredCall,
     state: Cell<State>,
     tries: Cell<u16>,
@@ -317,6 +362,18 @@ pub struct Hsmci<'a, A: Alarm<'a>> {
     /// Why the SD Status read during initialization failed, if it did. Kept
     /// apart because later reads overwrite `last_error`.
     init_error: Cell<ErrorInfo>,
+    /// The controller has been configured (`hw_init`) and enabled. A raw
+    /// command may be the first thing the host is ever asked to do.
+    hw_up: Cell<bool>,
+    /// Card clock last set, in Hz.
+    clock: Cell<u32>,
+    /// The raw command outstanding, and what it has produced so far.
+    raw_cmd: Cell<RawCommand>,
+    raw_result: Cell<RawResult>,
+    /// State to return to once a raw command is done: `Off` or `Ready`.
+    raw_return: Cell<State>,
+    /// Polls left before a raw R1b busy is given up on.
+    raw_busy_polls: Cell<u32>,
 }
 
 impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
@@ -328,6 +385,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             alarm,
             card_detect,
             client: OptionalCell::empty(),
+            write_client: OptionalCell::empty(),
             deferred_call: DeferredCall::new(),
             state: Cell::new(State::Off),
             tries: Cell::new(0),
@@ -342,6 +400,12 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             last_error: Cell::new(ErrorInfo::default()),
             timeout_ms: Cell::new(DATA_TIMEOUT_MS),
             init_error: Cell::new(ErrorInfo::default()),
+            hw_up: Cell::new(false),
+            clock: Cell::new(INIT_CLOCK_HZ),
+            raw_cmd: Cell::new(RawCommand::default()),
+            raw_result: Cell::new(RawResult::default()),
+            raw_return: Cell::new(State::Off),
+            raw_busy_polls: Cell::new(0),
         }
     }
 
@@ -398,6 +462,12 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         let (bits, actual) = Self::clock_bits(hz);
         let mr = self.regs.mr.get() & !(0xFF | MR_CLKODD);
         self.regs.mr.set(mr | bits);
+        // Above default speed the card drives data on the rising edge.
+        let cfg = self.regs.cfg.get() & !CFG_HSMODE;
+        self.regs
+            .cfg
+            .set(if actual > DATA_CLOCK_HZ { cfg | CFG_HSMODE } else { cfg });
+        self.clock.set(actual);
         self.regs.dtor.set(dtor_for(actual, self.timeout_ms.get()));
         actual
     }
@@ -431,12 +501,24 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         self.regs.sdcr.set(SDCR_BUS_1BIT);
         self.regs.dma.set(0); // PIO transfers only
         self.regs.cr.set(CR_MCIEN | CR_PWSDIS);
+        self.hw_up.set(true);
     }
 
     /// Issue one command and wait for its response. For R1b, also waits for
     /// the card to release DAT0.
     fn command(&self, cmdr: u32, arg: u32, resp: Resp) -> Result<(), ErrorCode> {
+        self.issue(cmdr, arg, resp)?;
+        if resp == Resp::R1b {
+            self.wait_not_busy()?;
+        }
+        Ok(())
+    }
+
+    /// Issue one command and wait for its response, but not for an R1b busy.
+    fn issue(&self, cmdr: u32, arg: u32, resp: Resp) -> Result<(), ErrorCode> {
         let data = cmdr & TRCMD_START != 0;
+        // FBYTE is left alone: only a raw command sets it, before issuing,
+        // and `finish_raw` clears it.
         let mr = self.regs.mr.get() & !(MR_RDPROOF | MR_WRPROOF);
         self.regs
             .mr
@@ -471,9 +553,6 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         // responses are left for `response_136`.
         if resp != Resp::R2 && resp != Resp::None {
             self.last_resp.set(self.regs.rspr[0].get());
-        }
-        if resp == Resp::R1b {
-            self.wait_not_busy()?;
         }
         Ok(())
     }
@@ -532,6 +611,63 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             chunk.copy_from_slice(&self.regs.rdr.get().to_le_bytes());
         }
         Ok(())
+    }
+
+    /// Read `out.len()` bytes one per RDR access, in `FBYTE` mode.
+    fn read_data_bytes(&self, out: &mut [u8]) -> Result<(), ErrorCode> {
+        for byte in out.iter_mut() {
+            self.wait_sr(SR_RXRDY)?;
+            *byte = self.regs.rdr.get() as u8;
+        }
+        Ok(())
+    }
+
+    /// Feed `data` to TDR, in the same byte order `read_data` takes it out:
+    /// the first byte in TDR[7:0]; a byte per access (`FBYTE`) if
+    /// `block_len` is not a multiple of 4. The controller paces the blocks
+    /// itself, waiting out the card's busy between them; after the last,
+    /// `wait_programmed`.
+    fn write_data(&self, data: &[u8], block_len: usize) -> Result<(), ErrorCode> {
+        for block in data.chunks(block_len) {
+            if block_len % 4 == 0 {
+                for chunk in block.chunks_exact(4) {
+                    self.wait_sr(SR_TXRDY)?;
+                    self.regs
+                        .tdr
+                        .set(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+            } else {
+                for &byte in block {
+                    self.wait_sr(SR_TXRDY)?;
+                    self.regs.tdr.set(byte as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After the last block of a write: wait while the card holds DAT0 low
+    /// to program it. NOTBUSY was cleared by the write command's response.
+    fn wait_programmed(&self) -> Result<(), ErrorCode> {
+        self.wait_sr(SR_NOTBUSY)
+    }
+
+    /// Wait for any of `bits` in SR, failing on a data error.
+    fn wait_sr(&self, bits: u32) -> Result<(), ErrorCode> {
+        let mut n = 0;
+        loop {
+            let sr = self.regs.sr.get();
+            if sr & bits != 0 {
+                return Ok(());
+            }
+            if sr & SR_DATA_ERRORS != 0 {
+                return Err(self.fail(ErrorStage::Data, sr, ErrorCode::FAIL));
+            }
+            n += 1;
+            if n > POLL_LIMIT {
+                return Err(self.fail(ErrorStage::Stuck, sr, ErrorCode::FAIL));
+            }
+        }
     }
 
     fn wait_xfrdone(&self) -> Result<(), ErrorCode> {
@@ -706,6 +842,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
 
     fn fail_init(&self, e: ErrorCode) {
         self.regs.cr.set(CR_MCIDIS);
+        self.hw_up.set(false);
         self.init_result.set(Err(e));
         self.state.set(State::InitDone);
         self.deferred_call.set();
@@ -791,6 +928,215 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         let count = self.read_count.get();
         if let Some(buf) = self.buffer.take() {
             self.client.map(move |c| c.read_done(buf, count, result));
+        }
+    }
+
+    /// Card clock in use.
+    fn clock_hz(&self) -> u32 {
+        self.clock.get()
+    }
+
+    /// Lengthen the data timeout to cover a write's programming busy.
+    fn set_write_timeout(&self) {
+        let ms = WRITE_TIMEOUT_MS.max(self.timeout_ms.get());
+        self.regs.dtor.set(dtor_for(self.clock_hz(), ms));
+    }
+
+    fn restore_timeout(&self) {
+        self.regs.dtor.set(dtor_for(self.clock_hz(), self.timeout_ms.get()));
+    }
+
+    // ----- writes --------------------------------------------------------
+
+    /// Issue CMD24/CMD25 for `count` blocks at `lba`. The data is left for
+    /// `write_chunk` to supply.
+    fn start_write(&self, lba: u32, count: u32, high_capacity: bool) -> Result<(), ErrorCode> {
+        let addr = if high_capacity { lba } else { lba * BLOCK_SIZE as u32 };
+        self.set_write_timeout();
+        self.regs.blkr.set(((BLOCK_SIZE as u32) << 16) | count);
+        let cmd = if count == 1 {
+            CMD24_WRITE_SINGLE | TRTYP_SINGLE
+        } else {
+            CMD25_WRITE_MULTIPLE | TRTYP_MULTIPLE
+        };
+        self.command(cmd | TRCMD_START, addr, Resp::R1)?;
+        // WP_VIOLATION, OUT_OF_RANGE, ADDRESS_ERROR... reported before any
+        // data is sent.
+        if self.response() & R1_ERRORS != 0 {
+            return Err(self.fail(ErrorStage::CardStatus, self.regs.sr.get(), ErrorCode::FAIL));
+        }
+        Ok(())
+    }
+
+    /// Supply up to `WRITE_CHUNK_BLOCKS` more blocks of the outstanding
+    /// write. Returns `Ok(true)` once the card has programmed them all.
+    fn write_chunk(&self, buf: &[u8]) -> Result<bool, ErrorCode> {
+        let (done, total) = (self.read_done.get(), self.read_count.get());
+        let n = (total - done).min(WRITE_CHUNK_BLOCKS);
+        let from = done as usize * BLOCK_SIZE;
+        self.write_data(&buf[from..from + n as usize * BLOCK_SIZE], BLOCK_SIZE)?;
+        self.read_done.set(done + n);
+        if done + n < total {
+            return Ok(false);
+        }
+        self.wait_programmed()?;
+        if total > 1 {
+            self.command(CMD12_STOP_TRANSMISSION | TRCMD_STOP, 0, Resp::R1b)?;
+        }
+        self.wait_xfrdone()?;
+        // Programming failures (CC_ERROR, CARD_ECC_FAILED, WP_VIOLATION on
+        // a later block) show up in the status that follows the data.
+        let rca_arg = (self.pending.get().rca as u32) << 16;
+        self.command(CMD13_SEND_STATUS, rca_arg, Resp::R1)?;
+        if self.response() & R1_ERRORS != 0 {
+            return Err(self.fail(ErrorStage::CardStatus, self.regs.sr.get(), ErrorCode::FAIL));
+        }
+        Ok(true)
+    }
+
+    fn finish_write(&self, result: Result<(), ErrorCode>) {
+        self.restore_timeout();
+        self.state.set(State::Ready);
+        let count = self.read_count.get();
+        if let Some(buf) = self.buffer.take() {
+            self.write_client.map(move |c| c.write_done(buf, count, result));
+        }
+    }
+
+    // ----- raw commands --------------------------------------------------
+
+    /// Issue the outstanding raw command and run its data phase, recording
+    /// what came back in `raw_result`. `Ok(true)` if it finished; `Ok(false)`
+    /// if it left an R1b busy for the alarm to wait out.
+    fn raw_execute(&self, buf: &mut [u8]) -> Result<bool, ErrorCode> {
+        let rc = self.raw_cmd.get();
+        self.raw_result.set(RawResult::default());
+        if !self.hw_up.get() {
+            self.hw_init();
+        }
+        if rc.init_clocks {
+            self.command(SPCMD_INIT, 0, Resp::None)?;
+            return Ok(true);
+        }
+
+        let resp = match rc.response {
+            RawResponse::None => Resp::None,
+            RawResponse::R1 => Resp::R1,
+            RawResponse::R1b => Resp::R1b,
+            RawResponse::R2 => Resp::R2,
+            RawResponse::R3 => Resp::R3,
+        };
+        let mut cmdr = rc.index as u32 & 0x3F;
+        if rc.index == 12 {
+            cmdr |= TRCMD_STOP;
+        }
+        if rc.data != RawData::None {
+            cmdr |= TRCMD_START
+                | if rc.data == RawData::Read { TRDIR_READ } else { 0 }
+                | if rc.block_count > 1 || rc.auto_stop { TRTYP_MULTIPLE } else { TRTYP_SINGLE };
+            self.regs
+                .blkr
+                .set(((rc.block_len as u32) << 16) | rc.block_count as u32);
+            if rc.data == RawData::Write {
+                self.set_write_timeout();
+            }
+            if rc.block_len % 4 != 0 {
+                self.regs.mr.set(self.regs.mr.get() | MR_FBYTE);
+            }
+        }
+
+        // A command without data leaves its R1b busy to the alarm; one with
+        // data waits for DAT0 as part of the transfer.
+        let issued = if resp == Resp::R1b && rc.data == RawData::None {
+            self.issue(cmdr, rc.arg, resp)
+        } else {
+            self.command(cmdr, rc.arg, resp)
+        };
+        let mut result = RawResult::default();
+        if let Err(e) = issued {
+            result.resp[0] = self.last_error.get().r1;
+            result.sr = self.last_error.get().sr;
+            self.raw_result.set(result);
+            return Err(e);
+        }
+        match resp {
+            Resp::None => {}
+            Resp::R2 => {
+                for w in result.resp.iter_mut() {
+                    *w = self.regs.rspr[0].get();
+                }
+            }
+            _ => result.resp[0] = self.response(),
+        }
+        self.raw_result.set(result);
+
+        if rc.data != RawData::None {
+            if let Err(e) = self.raw_data(&rc, buf, &mut result) {
+                result.sr = self.last_error.get().sr;
+                self.raw_result.set(result);
+                return Err(e);
+            }
+        } else if resp == Resp::R1b {
+            let sr = self.regs.sr.get();
+            if sr & SR_NOTBUSY == 0 || sr & SR_DTIP != 0 {
+                self.raw_busy_polls.set(RAW_BUSY_TIMEOUT_MS / RAW_BUSY_POLL_MS);
+                return Ok(false);
+            }
+        }
+        result.sr = self.regs.sr.get();
+        self.raw_result.set(result);
+        Ok(true)
+    }
+
+    /// The data phase of a raw command, then CMD12 if asked for.
+    fn raw_data(&self, rc: &RawCommand, buf: &mut [u8], result: &mut RawResult) -> Result<(), ErrorCode> {
+        let data = &mut buf[..rc.block_len as usize * rc.block_count as usize];
+        let bytewise = rc.block_len % 4 != 0;
+        match (rc.data, bytewise) {
+            (RawData::Read, false) => self.read_data(data)?,
+            (RawData::Read, true) => self.read_data_bytes(data)?,
+            _ => {
+                self.write_data(data, rc.block_len as usize)?;
+                self.wait_programmed()?;
+            }
+        }
+        result.bytes = data.len() as u32;
+        if rc.auto_stop {
+            self.command(CMD12_STOP_TRANSMISSION | TRCMD_STOP, 0, Resp::R1b)?;
+            result.stop_resp = self.response();
+        }
+        self.wait_xfrdone()
+    }
+
+    /// One alarm-paced check of a raw R1b command's busy.
+    fn raw_busy_step(&self) {
+        let sr = self.regs.sr.get();
+        let mut result = self.raw_result.get();
+        result.sr = sr;
+        self.raw_result.set(result);
+        if sr & SR_NOTBUSY != 0 && sr & SR_DTIP == 0 {
+            self.finish_raw(Ok(()));
+            return;
+        }
+        let left = self.raw_busy_polls.get();
+        if left == 0 {
+            let e = self.fail(ErrorStage::Busy, sr, ErrorCode::FAIL);
+            self.finish_raw(Err(e));
+            return;
+        }
+        self.raw_busy_polls.set(left - 1);
+        self.state.set(State::RawBusy);
+        self.alarm
+            .set_alarm(self.alarm.now(), self.alarm.ticks_from_ms(RAW_BUSY_POLL_MS));
+    }
+
+    fn finish_raw(&self, result: Result<(), ErrorCode>) {
+        self.regs.mr.set(self.regs.mr.get() & !MR_FBYTE);
+        self.restore_timeout();
+        self.state.set(self.raw_return.get());
+        let raw = self.raw_result.get();
+        if let Some(buf) = self.buffer.take() {
+            self.write_client.map(move |c| c.raw_done(buf, raw, result));
         }
     }
 }
@@ -928,10 +1274,99 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
     }
 }
 
+impl<'a, A: Alarm<'a>> SdmmcWrite<'a> for Hsmci<'a, A> {
+    fn set_write_client(&self, client: &'a dyn SdmmcWriteClient) {
+        self.write_client.set(client);
+    }
+
+    fn write_blocks(
+        &self,
+        buffer: &'static mut [u8],
+        lba: u32,
+        count: u32,
+    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+        if self.state.get() != State::Ready {
+            let e = if self.state.get() == State::Off { ErrorCode::OFF } else { ErrorCode::BUSY };
+            return Err((e, buffer));
+        }
+        let info = match self.info.get() {
+            Some(i) => i,
+            None => return Err((ErrorCode::OFF, buffer)),
+        };
+        let in_range = lba
+            .checked_add(count)
+            .is_some_and(|end| end <= info.block_count);
+        if count == 0 || count > 0xFFFF || !in_range || buffer.len() < count as usize * BLOCK_SIZE {
+            return Err((ErrorCode::INVAL, buffer));
+        }
+
+        if let Err(e) = self.start_write(lba, count, info.high_capacity) {
+            self.restore_timeout();
+            self.recover();
+            return Err((e, buffer));
+        }
+        self.read_count.set(count);
+        self.read_done.set(0);
+        self.buffer.replace(buffer);
+        self.state.set(State::Writing);
+        self.deferred_call.set();
+        Ok(())
+    }
+
+    fn raw_command(
+        &self,
+        command: RawCommand,
+        buffer: &'static mut [u8],
+    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+        let state = self.state.get();
+        if state != State::Off && state != State::Ready {
+            return Err((ErrorCode::BUSY, buffer));
+        }
+        let len = command.block_len as usize * command.block_count as usize;
+        let bad_data = command.data != RawData::None
+            && (command.block_len == 0
+                || command.block_len > 2048
+                || command.block_count == 0
+                || len > buffer.len());
+        if !command.init_clocks && (command.index > 63 || bad_data) {
+            return Err((ErrorCode::INVAL, buffer));
+        }
+        self.raw_cmd.set(command);
+        self.raw_return.set(state);
+        self.buffer.replace(buffer);
+        self.state.set(State::Raw);
+        self.deferred_call.set();
+        Ok(())
+    }
+
+    fn set_host_bus(&self, width: u8, clock_hz: u32) -> Result<u32, ErrorCode> {
+        let state = self.state.get();
+        if state != State::Off && state != State::Ready {
+            return Err(ErrorCode::BUSY);
+        }
+        if (width != 1 && width != 4) || clock_hz == 0 || clock_hz > HS_CLOCK_HZ {
+            return Err(ErrorCode::INVAL);
+        }
+        if !self.hw_up.get() {
+            self.hw_init();
+        }
+        self.regs.sdcr.set(if width == 4 { SDCR_BUS_4BIT } else { SDCR_BUS_1BIT });
+        let hz = self.set_clock(clock_hz);
+        if let Some(mut info) = self.info.get() {
+            info.bus_width = width;
+            info.clock_hz = hz;
+            self.info.set(info);
+        }
+        Ok(hz)
+    }
+}
+
 impl<'a, A: Alarm<'a>> AlarmClient for Hsmci<'a, A> {
     fn alarm(&self) {
-        if self.state.get() == State::WaitReady {
-            self.poll_ready_step();
+        match self.state.get() {
+            State::WaitReady => self.poll_ready_step(),
+            State::RawBusy => self.raw_busy_step(),
+            _ => {}
         }
     }
 }
@@ -965,6 +1400,30 @@ impl<'a, A: Alarm<'a>> DeferredCallClient for Hsmci<'a, A> {
                         self.abort_read();
                         self.finish_read(Err(e));
                     }
+                }
+            }
+            State::Writing => {
+                let step = self
+                    .buffer
+                    .map_or(Err(ErrorCode::FAIL), |buf| self.write_chunk(buf));
+                match step {
+                    Ok(false) => self.deferred_call.set(),
+                    Ok(true) => self.finish_write(Ok(())),
+                    Err(e) => {
+                        // A card mid-write sits in rcv state until CMD12.
+                        self.recover();
+                        self.finish_write(Err(e));
+                    }
+                }
+            }
+            State::Raw => {
+                let step = self
+                    .buffer
+                    .map_or(Err(ErrorCode::FAIL), |buf| self.raw_execute(buf));
+                match step {
+                    Ok(true) => self.finish_raw(Ok(())),
+                    Ok(false) => self.raw_busy_step(),
+                    Err(e) => self.finish_raw(Err(e)),
                 }
             }
             _ => {}

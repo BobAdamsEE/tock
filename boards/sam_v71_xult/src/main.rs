@@ -4,7 +4,8 @@
 //! - Console: USART1 via EDBG CDC (PA21 RXD, PB4 TXD), 115200 baud, mirrored to SEGGER RTT
 //! - LED0: PA23, LED1: PC9 (active-low)
 //! - Alarm: TC0 channel 0, SLCK @ 32 kHz
-//! - SD card: HSMCI slot A, 4-bit, read-only (PA25-PA31, card detect PD18)
+//! - SD card: HSMCI slot A, 4-bit, read-only unless built with the `sd_write`
+//!   feature (PA25-PA31, card detect PD18)
 
 #![no_std]
 #![no_main]
@@ -100,7 +101,7 @@ struct SamV71Xult {
         'static,
         capsules_core::virtualizers::virtual_can::CanDevice<'static, mcan::Mcan>,
     >,
-    /// SD card, read-only (HSMCI slot A).
+    /// SD card (HSMCI slot A); read-only without the `sd_write` feature.
     sdmmc: &'static capsules_extra::sdmmc::SdmmcDriver<'static, SdHost>,
     /// Reboot-into-bootloader driver, restricted to the signed UDS app.
     bl_reboot: &'static bl_reboot::BootloaderReboot<'static>,
@@ -361,7 +362,7 @@ pub unsafe fn main() {
     ));
 
     // -----------------------------------------------------------------------
-    // SD card (HSMCI slot A), read-only
+    // SD card (HSMCI slot A), read-only unless built with `sd_write`
     // -----------------------------------------------------------------------
     // PA25 = MCCK (Peripheral D); PA28 = MCCDA, PA30/PA31/PA26/PA27 = MCDA0-3
     // (Peripheral C); PD18 = card detect, active low. CMD and DAT need
@@ -406,6 +407,10 @@ pub unsafe fn main() {
         )
     );
     hil::sdmmc::Sdmmc::set_client(hsmci, sdmmc);
+    if cfg!(feature = "sd_write") {
+        hil::sdmmc::SdmmcWrite::set_write_client(hsmci, sdmmc);
+        sdmmc.enable_writes(hsmci);
+    }
 
     // -----------------------------------------------------------------------
     // I2C bus (TWIHS0) + AT24MAC402 EEPROM
