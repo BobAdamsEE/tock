@@ -1,3 +1,7 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 //! A UART that also mirrors everything it transmits to a second transmitter.
 //!
 //! The board's console and `debug!` output go to USART1 (the EDBG virtual COM
@@ -13,9 +17,9 @@
 
 use core::cell::Cell;
 
+use kernel::ErrorCode;
 use kernel::hil::uart;
 use kernel::utilities::cells::OptionalCell;
-use kernel::ErrorCode;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
@@ -48,7 +52,8 @@ impl<'a> ConsoleTee<'a> {
     fn finish(&self, buffer: &'static mut [u8]) {
         self.stage.set(Stage::Idle);
         let (len, status) = (self.len.get(), self.status.get());
-        self.client.map(move |c| c.transmitted_buffer(buffer, len, status));
+        self.client
+            .map(move |c| c.transmitted_buffer(buffer, len, status));
     }
 }
 

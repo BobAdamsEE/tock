@@ -15,11 +15,11 @@
 //!
 //! Register map: SAMV71Q21B datasheet Table 31-3, base address 0x400E_0600.
 
+use kernel::utilities::StaticRef;
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{
-    register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly,
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
 };
-use kernel::utilities::StaticRef;
 
 // ---------------------------------------------------------------------------
 // Register map
@@ -223,11 +223,18 @@ const PMC_BASE: StaticRef<PmcRegisters> =
 const WP_KEY: u32 = 0x504D43; // ASCII "PMC"
 const MOR_KEY: u32 = 0x37;
 
-pub static mut PMC: Pmc = Pmc::new();
+/// The one PMC. A plain `static` rather than `static mut`: every method takes
+/// `&self` and goes straight to the hardware registers.
+pub static PMC: Pmc = Pmc::new();
 
 pub struct Pmc {
     regs: StaticRef<PmcRegisters>,
 }
+
+// SAFETY: `Pmc` holds only the address of its memory-mapped registers and no
+// software state. The SAMV71 has a single core, so there is no other thread to
+// share it with.
+unsafe impl Sync for Pmc {}
 
 impl Pmc {
     pub const fn new() -> Pmc {
@@ -276,9 +283,7 @@ impl Pmc {
         // the active MAINCK source while the crystal stabilises.
         // ---------------------------------------------------------------
         self.regs.ckgr_mor.modify(
-            CkgrMor::KEY.val(MOR_KEY)
-                + CkgrMor::MOSCXTEN::SET
-                + CkgrMor::MOSCXTST.val(255),
+            CkgrMor::KEY.val(MOR_KEY) + CkgrMor::MOSCXTEN::SET + CkgrMor::MOSCXTST.val(255),
         );
 
         // Poll MOSCXTS with a timeout. At the slowest RC (4 MHz) and
@@ -292,16 +297,15 @@ impl Pmc {
             }
         }
 
-        let mula;
-        if crystal_ok {
+        let mula = if crystal_ok {
             // Switch MAINCK to the external crystal.
-            self.regs.ckgr_mor.modify(
-                CkgrMor::KEY.val(MOR_KEY) + CkgrMor::MOSCSEL::SET,
-            );
+            self.regs
+                .ckgr_mor
+                .modify(CkgrMor::KEY.val(MOR_KEY) + CkgrMor::MOSCSEL::SET);
             while !self.regs.pmc_sr.is_set(PmcSr::MOSCSELS) {}
 
             // Deterministic, no MOSCRCF ambiguity.
-            mula = 300_000_000 / crystal_hz - 1;
+            300_000_000 / crystal_hz - 1
         } else {
             // Crystal did not start — fall back to internal RC.
             //
@@ -310,12 +314,12 @@ impl Pmc {
             // a prior boot left behind. Pick a PLLA multiplier that
             // produces ~300 MHz from the current RC frequency.
             let moscrcf = self.regs.ckgr_mor.read(CkgrMor::MOSCRCF);
-            mula = match moscrcf {
+            match moscrcf {
                 0 => 74, // 4 MHz × 75 = 300 MHz
                 1 => 36, // 8 MHz × 37 = 296 MHz
                 _ => 24, // 12 MHz × 25 = 300 MHz
-            };
-        }
+            }
+        };
 
         self.regs.ckgr_pllar.write(
             CkgrPllar::ONE::SET
@@ -397,12 +401,15 @@ impl Pmc {
     /// `div`: division factor (output = source / (div + 1))
     pub fn configure_gclk(&self, pid: u32, css: u32, div: u32) {
         self.disable_write_protection();
+        // PID, CMD (bit 12, write command), EN (bit 28, peripheral clock
+        // enable), GCLKEN (bit 29, generic clock enable), GCLKCSS (bits 8-10)
+        // and GCLKDIV (bits 20-27).
         let pcr_val = (pid & 0x7F)
-            | (1 << 12)           // CMD (write command)
-            | (1 << 28)           // EN (peripheral clock enable)
-            | (1 << 29)           // GCLKEN (generic clock enable)
-            | ((css & 0x7) << 8)  // GCLKCSS
-            | ((div & 0xFF) << 20); // GCLKDIV
+            | (1 << 12)
+            | (1 << 28)
+            | (1 << 29)
+            | ((css & 0x7) << 8)
+            | ((div & 0xFF) << 20);
         self.regs.pmc_pcr.set(pcr_val);
         self.enable_write_protection();
     }

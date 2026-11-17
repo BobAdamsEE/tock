@@ -7,12 +7,12 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel::hil;
 use kernel::hil::gpio;
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
 use kernel::utilities::registers::{
-    register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly,
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
 };
-use kernel::utilities::StaticRef;
 
 const BASE_ADDRESS: usize = 0x400E_0E00;
 const SIZE: usize = 0x200;
@@ -3436,7 +3436,7 @@ pub enum Pin {
 ///
 /// The SAMV71 divides GPIOs into _ports_ that each manage a group of 32
 /// individual pins. There are up to five ports, depending particular chip
-/// (see[^1]).
+/// (see the SAMV71 datasheet).
 ///
 /// In general, the kernel and applications should care about individual
 /// [GPIOPin](struct.GPIOPin.html)s. However, mirroring the hardware grouping in
@@ -3662,7 +3662,7 @@ impl<'a> PortE<'a> {
     }
 }
 
-impl<'a, const N: usize> Port<'a, N> {
+impl<const N: usize> Port<'_, N> {
     pub fn handle_interrupt(&self) {
         let port: &GpioRegisters = &self.registers;
 

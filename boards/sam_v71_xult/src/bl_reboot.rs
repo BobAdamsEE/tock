@@ -1,3 +1,7 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 //! Reboot into the bootloader, for one authorised application only.
 //!
 //! This is the transition step of the reflashing architecture: the UDS app

@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! TC0 Channel 0 timer driver for SAMV71Q21B.
 //!
@@ -11,12 +12,14 @@
 
 use core::cell::Cell;
 
+use kernel::ErrorCode;
 use kernel::hil::time::{self, Ticks, Ticks32};
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
-use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly};
-use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
+use kernel::utilities::registers::{
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
+};
 
 // ---------------------------------------------------------------------------
 // Register layout – one TC channel block (offset within TC0 base)
@@ -91,7 +94,7 @@ pub struct Tc<'a> {
     running: Cell<bool>,
 }
 
-impl<'a> Tc<'a> {
+impl Tc<'_> {
     pub const fn new() -> Self {
         Tc {
             regs: TC0_CH0_BASE,
@@ -152,7 +155,7 @@ impl<'a> Tc<'a> {
 // HIL: Time
 // ---------------------------------------------------------------------------
 
-impl<'a> time::Time for Tc<'a> {
+impl time::Time for Tc<'_> {
     type Frequency = time::Freq32KHz;
     type Ticks = Ticks32;
 
@@ -171,7 +174,9 @@ impl<'a> time::Counter<'a> for Tc<'a> {
             return Ok(());
         }
         // WAVEFORM, UP (free-running), TIMER_CLOCK5 (SLCK).
-        self.regs.cmr.write(Cmr::WAVE::SET + Cmr::WAVSEL::Up + Cmr::TCCLKS::Clock5);
+        self.regs
+            .cmr
+            .write(Cmr::WAVE::SET + Cmr::WAVSEL::Up + Cmr::TCCLKS::Clock5);
         // Enable COVFS so we can track overflows.
         self.regs.ier.write(Ir::COVFS::SET);
         // Enable clock and trigger.

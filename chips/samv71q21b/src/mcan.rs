@@ -46,15 +46,13 @@
 //! - MCAN1_RX: PC12 (Peripheral C)
 
 use core::cell::Cell;
+use kernel::ErrorCode;
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
 use kernel::hil::can::{self, StandardBitTiming};
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
-use kernel::utilities::registers::{
-    register_bitfields, register_structs, ReadOnly, ReadWrite,
-};
-use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
+use kernel::utilities::registers::{ReadOnly, ReadWrite, register_bitfields, register_structs};
 
 // ---------------------------------------------------------------------------
 // MCAN base addresses and peripheral IDs
@@ -151,8 +149,7 @@ const EXT_ID_MASK: u32 = 0x1FFF_FFFF;
 const RX_FIFO0_WORDS: usize = RX_FIFO0_COUNT * CAN_ELEMENT_WORDS;
 const TX_BUF_WORDS: usize = TX_BUF_COUNT * CAN_ELEMENT_WORDS;
 
-const MSG_RAM_WORDS: usize =
-    STD_FILTER_WORDS + EXT_FILTER_WORDS + RX_FIFO0_WORDS + TX_BUF_WORDS;
+const MSG_RAM_WORDS: usize = STD_FILTER_WORDS + EXT_FILTER_WORDS + RX_FIFO0_WORDS + TX_BUF_WORDS;
 
 // Word offsets within the message RAM array
 const STD_FILTER_OFFSET: usize = 0;
@@ -506,10 +503,8 @@ pub struct Mcan {
     /// of them. Only one set is ever live -- a classic kernel registers the
     /// 8-byte clients, an FD bootloader the 64-byte ones -- so the unused pair
     /// costs a few pointers of static and nothing at run time.
-    transmit_client_fd:
-        OptionalCell<&'static dyn can::TransmitClient<{ can::FD_CAN_PACKET_SIZE }>>,
-    receive_client_fd:
-        OptionalCell<&'static dyn can::ReceiveClient<{ can::FD_CAN_PACKET_SIZE }>>,
+    transmit_client_fd: OptionalCell<&'static dyn can::TransmitClient<{ can::FD_CAN_PACKET_SIZE }>>,
+    receive_client_fd: OptionalCell<&'static dyn can::ReceiveClient<{ can::FD_CAN_PACKET_SIZE }>>,
 
     tx_buffer_fd: TakeCell<'static, [u8; can::FD_CAN_PACKET_SIZE]>,
     rx_buffer_fd: TakeCell<'static, [u8; can::FD_CAN_PACKET_SIZE]>,
@@ -609,7 +604,9 @@ impl Mcan {
     fn dcache_clean(addr: usize, len: usize) {
         if !Self::is_dcache_enabled() {
             // Cache is off: writes go straight to SRAM, no flush needed.
-            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
             return;
         }
         const DCCMVAC: *mut u32 = 0xE000_EF68 as *mut u32;
@@ -635,7 +632,9 @@ impl Mcan {
         if !Self::is_dcache_enabled() {
             // Cache is off: MCAN DMA writes go straight to SRAM, CPU reads
             // come straight from SRAM — no invalidation needed.
-            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
             return;
         }
         const DCIMVAC: *mut u32 = 0xE000_EF5C as *mut u32;
@@ -765,12 +764,10 @@ impl Mcan {
         // frame on the bus was delivered and clients discarded the unwanted
         // ones in software. That does not scale to several clients sharing the
         // peripheral, and on a busy bus it spends an interrupt per frame.
-        self.regs.gfc.write(
-            GFC::ANFS.val(2) // Reject non-matching standard frames
-                + GFC::ANFE.val(2) // Reject non-matching extended frames
-                + GFC::RRFS::CLEAR
-                + GFC::RRFE::CLEAR,
-        );
+        // ANFS = 2, ANFE = 2: reject non-matching standard and extended frames.
+        self.regs
+            .gfc
+            .write(GFC::ANFS.val(2) + GFC::ANFE.val(2) + GFC::RRFS::CLEAR + GFC::RRFE::CLEAR);
 
         // Enable TX/error interrupts only.  RF0NE/RF0LE (RX FIFO 0) are
         // intentionally omitted here: the MCAN controller goes live on the
@@ -789,11 +786,9 @@ impl Mcan {
         // cancellations via TXBCR.
         // BOE/EPE/EWE are NOT enabled — bus error state changes are handled
         // inside handle_interrupt whenever TC or PEAE brings us in.
-        self.regs.ie.write(
-            IE::TCE::SET
-                + IE::TCFE::SET
-                + IE::PEAE::SET,
-        );
+        self.regs
+            .ie
+            .write(IE::TCE::SET + IE::TCFE::SET + IE::PEAE::SET);
 
         // All interrupts → line 0
         self.regs.ils.set(0);
@@ -917,12 +912,7 @@ impl Mcan {
     /// Find a free TX buffer slot, returns the index.
     fn find_free_tx_buf(&self) -> Option<usize> {
         let pending = self.regs.txbrp.get();
-        for i in 0..TX_BUF_COUNT {
-            if pending & (1 << i) == 0 {
-                return Some(i);
-            }
-        }
-        None
+        (0..TX_BUF_COUNT).find(|&i| pending & (1 << i) == 0)
     }
 
     /// Write a frame into a TX buffer and request transmission.
@@ -1223,7 +1213,7 @@ impl Mcan {
                 client.message_received(frame_id, &mut frame_data, frame_len, Ok(()));
             });
         } else {
-            self.dispatch_classic(frame_id, &mut frame_data, frame_len);
+            self.dispatch_classic(frame_id, &frame_data, frame_len);
         }
         true
     }
@@ -1281,15 +1271,13 @@ impl Mcan {
         });
 
         // Acknowledge the element so the FIFO advances
-        self.regs
-            .rxf0a
-            .write(RXF0A::F0AI.val(get_idx as u32));
+        self.regs.rxf0a.write(RXF0A::F0AI.val(get_idx as u32));
 
         Some((frame_id, frame_data, frame_len))
     }
 
     /// Hand a frame to a classic-width client.
-    fn dispatch_classic(&self, frame_id: can::Id, frame_data: &mut [u8], frame_len: usize) {
+    fn dispatch_classic(&self, frame_id: can::Id, frame_data: &[u8], frame_len: usize) {
         // A classic client cannot be handed more than 8 bytes. With FDOE
         // clear the hardware will not accept a longer frame anyway, so this
         // only bites if FD was configured and a classic client registered --

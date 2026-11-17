@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! Userspace access to a native-mode SD card host (`hil::sdmmc::Sdmmc`).
 //!
@@ -87,8 +88,8 @@ use core::cmp;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil::sdmmc::{
-    CardInfo, RawCommand, RawData, RawResponse, RawResult, Sdmmc, SdmmcClient, SdmmcWrite,
-    SdmmcWriteClient, BLOCK_SIZE,
+    BLOCK_SIZE, CardInfo, RawCommand, RawData, RawResponse, RawResult, Sdmmc, SdmmcClient,
+    SdmmcWrite, SdmmcWriteClient,
 };
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
@@ -166,7 +167,13 @@ impl<'a, S: Sdmmc<'a>> SdmmcDriver<'a, S> {
     }
 
     /// Start a write of `count` blocks from the owner's RO allow 0.
-    fn write(&self, writer: &'a dyn SdmmcWrite<'a>, lba: u32, count: usize, pid: ProcessId) -> CommandReturn {
+    fn write(
+        &self,
+        writer: &'a dyn SdmmcWrite<'a>,
+        lba: u32,
+        count: usize,
+        pid: ProcessId,
+    ) -> CommandReturn {
         if count == 0 || count > self.max_blocks {
             return CommandReturn::failure(ErrorCode::INVAL);
         }
@@ -351,7 +358,11 @@ impl<'a, S: Sdmmc<'a>> SdmmcClient for SdmmcDriver<'a, S> {
 impl<'a, S: Sdmmc<'a>> SdmmcWriteClient for SdmmcDriver<'a, S> {
     fn write_done(&self, buffer: &'static mut [u8], count: u32, result: Result<(), ErrorCode>) {
         self.kernel_buf.replace(buffer);
-        let written = if result.is_ok() { count as usize * BLOCK_SIZE } else { 0 };
+        let written = if result.is_ok() {
+            count as usize * BLOCK_SIZE
+        } else {
+            0
+        };
         self.upcall(KIND_WRITE, result, written);
     }
 
@@ -375,14 +386,16 @@ impl<'a, S: Sdmmc<'a>> SdmmcWriteClient for SdmmcDriver<'a, S> {
                 });
                 // Read data (a write's data is not copied back: the buffer
                 // still holds what was sent).
-                let _ = kd.get_readwrite_processbuffer(rw_allow::READ).and_then(|b| {
-                    b.mut_enter(|app_buf| {
-                        let n = cmp::min(app_buf.len(), len);
-                        if self.raw_read.get() {
-                            app_buf[..n].copy_from_slice(&buffer[..n]);
-                        }
-                    })
-                });
+                let _ = kd
+                    .get_readwrite_processbuffer(rw_allow::READ)
+                    .and_then(|b| {
+                        b.mut_enter(|app_buf| {
+                            let n = cmp::min(app_buf.len(), len);
+                            if self.raw_read.get() {
+                                app_buf[..n].copy_from_slice(&buffer[..n]);
+                            }
+                        })
+                    });
             });
         });
         self.kernel_buf.replace(buffer);
@@ -391,7 +404,13 @@ impl<'a, S: Sdmmc<'a>> SdmmcWriteClient for SdmmcDriver<'a, S> {
 }
 
 impl<'a, S: Sdmmc<'a>> SyscallDriver for SdmmcDriver<'a, S> {
-    fn command(&self, command_num: usize, arg1: usize, arg2: usize, pid: ProcessId) -> CommandReturn {
+    fn command(
+        &self,
+        command_num: usize,
+        arg1: usize,
+        arg2: usize,
+        pid: ProcessId,
+    ) -> CommandReturn {
         if command_num == 0 {
             return CommandReturn::success();
         }
@@ -460,7 +479,11 @@ impl<'a, S: Sdmmc<'a>> SyscallDriver for SdmmcDriver<'a, S> {
             // Status read during initialization. Returns
             // (cmd | stage << 8 | card_state << 16, controller SR, R1).
             6 => {
-                let e = if arg1 == 1 { self.host.init_error() } else { self.host.last_error() };
+                let e = if arg1 == 1 {
+                    self.host.init_error()
+                } else {
+                    self.host.last_error()
+                };
                 CommandReturn::success_u32_u32_u32(
                     (e.cmd as u32) | ((e.stage as u32) << 8) | ((e.card_state as u32) << 16),
                     e.sr,

@@ -1,3 +1,6 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
@@ -43,7 +46,7 @@ use core::cmp;
 
 use kernel::hil::i2c::{Error, I2CClient, I2CDevice};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::{hil, ErrorCode};
+use kernel::{ErrorCode, hil};
 
 const PAGE_SIZE: usize = 16;
 const EEPROM_SIZE: usize = 256;

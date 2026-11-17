@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! HSMCI (High Speed MultiMedia Card Interface) SD memory card host for the
 //! SAMV71, implementing `kernel::hil::sdmmc::Sdmmc` (read-only) and
@@ -45,17 +46,17 @@
 
 use core::cell::Cell;
 
+use kernel::ErrorCode;
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
 use kernel::hil::sdmmc::{
-    CardInfo, ErrorInfo, ErrorStage, RawCommand, RawData, RawResponse, RawResult, Sdmmc,
-    SdmmcClient, SdmmcWrite, SdmmcWriteClient, BLOCK_SIZE,
+    BLOCK_SIZE, CardInfo, ErrorInfo, ErrorStage, RawCommand, RawData, RawResponse, RawResult,
+    Sdmmc, SdmmcClient, SdmmcWrite, SdmmcWriteClient,
 };
 use kernel::hil::time::{Alarm, AlarmClient, ConvertTicks};
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
-use kernel::utilities::registers::{register_structs, ReadOnly, ReadWrite, WriteOnly};
-use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
+use kernel::utilities::registers::{ReadOnly, ReadWrite, WriteOnly, register_structs};
 
 use crate::gpio::GPIOPin;
 
@@ -78,31 +79,36 @@ const ACMD41_RETRY_MS: u32 = 10;
 /// second to power up; this allows 1.5 s.
 const ACMD41_MAX_TRIES: u16 = 150;
 
-/// Blocks drained per deferred call. A larger read is one CMD18 spread over
-/// several deferred calls: `RDPROOF` stops the card clock while the CPU is
+/// Blocks drained per deferred call.
+///
+/// A larger read is one CMD18 spread over several deferred calls: `RDPROOF` stops the card clock while the CPU is
 /// away, so the card simply waits. This bounds how long the kernel spends
 /// polling at a stretch -- about 0.35 ms at 25 MHz x 4 bits -- however large
 /// the read, which matters because one CMD18 costs this card ~2 ms of access
 /// latency and so large reads are much faster than many small ones.
 const READ_CHUNK_BLOCKS: u32 = 8;
 
-/// Bound on any single status-polling loop. Hardware timeouts (RTOE, DTOE,
-/// CSTOE) are what normally end a stuck operation; this only guards against
+/// Bound on any single status-polling loop.
+///
+/// Hardware timeouts (RTOE, DTOE, CSTOE) are what normally end a stuck operation; this only guards against
 /// a controller that never raises them, and must outlast them -- at 10 M
 /// iterations it fired before a slow-clock data timeout did, turning a clear
 /// DTOE into an unexplained "stuck". Several seconds at tens of ns a read.
 const POLL_LIMIT: u32 = 100_000_000;
 
-/// Data timeout, whatever the card clock: the SD specification's read
-/// timeout (100 ms; for SDSC, the TAAC/NSAC-derived figure, capped at the
-/// same). A block that takes longer is out of spec, so treating it as bad
+/// Data timeout, whatever the card clock.
+///
+/// It is the SD specification's read timeout (100 ms; for SDSC, the
+/// TAAC/NSAC-derived figure, capped at the same). A block that takes longer is out of spec, so treating it as bad
 /// loses nothing a compliant host would have got -- and on a card with
 /// thousands of bad blocks every failure costs this much. 250 ms made a
 /// damaged 3 MB photo take ~26 s to check.
 const DATA_TIMEOUT_MS: u32 = 100;
 
-/// Data timeout while writing: the SD specification's write timeout, 250 ms
-/// for SDSC/SDHC and 500 ms for SDXC. A card may legitimately stay busy this
+/// Data timeout while writing.
+///
+/// It is the SD specification's write timeout, 250 ms for SDSC/SDHC and
+/// 500 ms for SDXC. A card may legitimately stay busy this
 /// long after a block, so the read timeout would fail good writes.
 const WRITE_TIMEOUT_MS: u32 = 500;
 
@@ -178,8 +184,9 @@ const SDCR_BUS_4BIT: u32 = 2 << 6;
 // DTOR / CSTOR: largest timeout, 15 x 1048576 card clocks.
 const TIMEOUT_MAX: u32 = 0x7F;
 
-/// DTOR value for a `DATA_TIMEOUT_MS` timeout at card clock `hz`. The
-/// register counts card clocks -- DTOCYC (0-15) times a DTOMUL multiplier --
+/// DTOR value for a `DATA_TIMEOUT_MS` timeout at card clock `hz`.
+///
+/// The register counts card clocks -- DTOCYC (0-15) times a DTOMUL multiplier --
 /// so a fixed value means a timeout that grows as the clock is lowered.
 fn dtor_for(hz: u32, timeout_ms: u32) -> u32 {
     const MULT: [u32; 8] = [1, 16, 128, 256, 1024, 4096, 65536, 1048576];
@@ -229,8 +236,7 @@ const SR_XFRDONE: u32 = 1 << 27;
 const SR_OVRE: u32 = 1 << 30;
 const SR_UNRE: u32 = 1 << 31;
 
-const SR_RESPONSE_ERRORS: u32 =
-    SR_RINDE | SR_RDIRE | SR_RCRCE | SR_RENDE | SR_RTOE | SR_CSTOE;
+const SR_RESPONSE_ERRORS: u32 = SR_RINDE | SR_RDIRE | SR_RCRCE | SR_RENDE | SR_RTOE | SR_CSTOE;
 const SR_DATA_ERRORS: u32 = SR_DCRCE | SR_DTOE | SR_OVRE | SR_UNRE;
 
 // ---------------------------------------------------------------------------
@@ -283,7 +289,8 @@ const CMD9_SEND_CSD: u32 = 9;
 const CMD12_STOP_TRANSMISSION: u32 = 12;
 const CMD13_SEND_STATUS: u32 = 13;
 
-/// R1 card-status bits that mean the command did not do what was asked:
+/// R1 card-status bits that mean the command did not do what was asked.
+///
 /// OUT_OF_RANGE, ADDRESS_ERROR, BLOCK_LEN_ERROR, ERASE_SEQ_ERROR,
 /// ERASE_PARAM, WP_VIOLATION, LOCK_UNLOCK_FAILED, COM_CRC_ERROR,
 /// ILLEGAL_COMMAND, CARD_ECC_FAILED, CC_ERROR, ERROR. (Bit 25,
@@ -420,7 +427,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             // A failed response was never latched: take what the controller
             // holds (possibly garbage, but it is what arrived), not the
             // previous command's.
-            r1: if stage == ErrorStage::Response { self.regs.rspr[0].get() } else { self.last_resp.get() },
+            r1: if stage == ErrorStage::Response {
+                self.regs.rspr[0].get()
+            } else {
+                self.last_resp.get()
+            },
             card_state: 0xFF,
         });
         self.soft_reset();
@@ -464,9 +475,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         self.regs.mr.set(mr | bits);
         // Above default speed the card drives data on the rising edge.
         let cfg = self.regs.cfg.get() & !CFG_HSMODE;
-        self.regs
-            .cfg
-            .set(if actual > DATA_CLOCK_HZ { cfg | CFG_HSMODE } else { cfg });
+        self.regs.cfg.set(if actual > DATA_CLOCK_HZ {
+            cfg | CFG_HSMODE
+        } else {
+            cfg
+        });
         self.clock.set(actual);
         self.regs.dtor.set(dtor_for(actual, self.timeout_ms.get()));
         actual
@@ -520,9 +533,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         // FBYTE is left alone: only a raw command sets it, before issuing,
         // and `finish_raw` clears it.
         let mr = self.regs.mr.get() & !(MR_RDPROOF | MR_WRPROOF);
-        self.regs
-            .mr
-            .set(if data { mr | MR_RDPROOF | MR_WRPROOF } else { mr });
+        self.regs.mr.set(if data {
+            mr | MR_RDPROOF | MR_WRPROOF
+        } else {
+            mr
+        });
         if !data {
             self.regs.blkr.set(0);
         }
@@ -536,7 +551,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         loop {
             let sr = self.regs.sr.get();
             if sr & mask != 0 {
-                let code = if sr & (SR_RTOE | SR_CSTOE) != 0 { ErrorCode::NOACK } else { ErrorCode::FAIL };
+                let code = if sr & (SR_RTOE | SR_CSTOE) != 0 {
+                    ErrorCode::NOACK
+                } else {
+                    ErrorCode::FAIL
+                };
                 return Err(self.fail(ErrorStage::Response, sr, code));
             }
             if sr & SR_CMDRDY != 0 {
@@ -579,7 +598,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     /// The four words of a 136-bit response, as 16 bytes, MSB first.
     fn response_136(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
-        for chunk in out.chunks_exact_mut(4) {
+        for chunk in out.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&self.regs.rspr[0].get().to_be_bytes());
         }
         out
@@ -593,7 +612,7 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     /// Drain `out.len()` bytes from RDR. Bytes arrive in bus order, the first
     /// in RDR[7:0].
     fn read_data(&self, out: &mut [u8]) -> Result<(), ErrorCode> {
-        for chunk in out.chunks_exact_mut(4) {
+        for chunk in out.as_chunks_mut::<4>().0 {
             let mut n = 0;
             loop {
                 let sr = self.regs.sr.get();
@@ -629,8 +648,8 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     /// `wait_programmed`.
     fn write_data(&self, data: &[u8], block_len: usize) -> Result<(), ErrorCode> {
         for block in data.chunks(block_len) {
-            if block_len % 4 == 0 {
-                for chunk in block.chunks_exact(4) {
+            if block_len.is_multiple_of(4) {
+                for chunk in block.as_chunks::<4>().0 {
                     self.wait_sr(SR_TXRDY)?;
                     self.regs
                         .tdr
@@ -786,16 +805,26 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
             // in the holder) passes everything up to here, then fails every
             // 4-bit transfer -- which reads exactly like a card full of bad
             // sectors. If 1-bit works where 4-bit did not, stay at 1 bit.
-            if info.bus_width == 4 && self.app_command(ACMD6_SET_BUS_WIDTH, 0, Resp::R1, info.rca).is_ok() {
+            if info.bus_width == 4
+                && self
+                    .app_command(ACMD6_SET_BUS_WIDTH, 0, Resp::R1, info.rca)
+                    .is_ok()
+            {
                 self.regs.sdcr.set(SDCR_BUS_1BIT);
-                if self.read_short_block(ACMD13_SD_STATUS, 0, Some(info.rca), &mut info.ssr).is_ok() {
+                if self
+                    .read_short_block(ACMD13_SD_STATUS, 0, Some(info.rca), &mut info.ssr)
+                    .is_ok()
+                {
                     info.ssr_valid = true;
                     info.bus_width = 1;
                     info.bus_fallback = true;
                 } else {
                     // Not the bus, then: go back to 4 bits.
                     self.recover();
-                    if self.app_command(ACMD6_SET_BUS_WIDTH, 2, Resp::R1, info.rca).is_ok() {
+                    if self
+                        .app_command(ACMD6_SET_BUS_WIDTH, 2, Resp::R1, info.rca)
+                        .is_ok()
+                    {
                         self.regs.sdcr.set(SDCR_BUS_4BIT);
                     } else {
                         info.bus_width = 1;
@@ -812,7 +841,12 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         let ccc = ((info.csd[4] as u32) << 4) | ((info.csd[5] as u32) >> 4);
         info.switch_valid = ccc & (1 << 10) != 0
             && self
-                .read_short_block(CMD6_SWITCH_FUNC, CMD6_CHECK_ALL_UNCHANGED, None, &mut info.switch_status)
+                .read_short_block(
+                    CMD6_SWITCH_FUNC,
+                    CMD6_CHECK_ALL_UNCHANGED,
+                    None,
+                    &mut info.switch_status,
+                )
                 .is_ok();
         if ccc & (1 << 10) != 0 && !info.switch_valid {
             self.recover();
@@ -879,7 +913,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     /// Issue CMD17/CMD18 for `count` blocks at `lba`. The data is left for
     /// `read_chunk` to drain.
     fn start_read(&self, lba: u32, count: u32, high_capacity: bool) -> Result<(), ErrorCode> {
-        let addr = if high_capacity { lba } else { lba * BLOCK_SIZE as u32 };
+        let addr = if high_capacity {
+            lba
+        } else {
+            lba * BLOCK_SIZE as u32
+        };
         self.regs.blkr.set(((BLOCK_SIZE as u32) << 16) | count);
         let cmd = if count == 1 {
             CMD17_READ_SINGLE | TRTYP_SINGLE
@@ -943,7 +981,9 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     }
 
     fn restore_timeout(&self) {
-        self.regs.dtor.set(dtor_for(self.clock_hz(), self.timeout_ms.get()));
+        self.regs
+            .dtor
+            .set(dtor_for(self.clock_hz(), self.timeout_ms.get()));
     }
 
     // ----- writes --------------------------------------------------------
@@ -951,7 +991,11 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     /// Issue CMD24/CMD25 for `count` blocks at `lba`. The data is left for
     /// `write_chunk` to supply.
     fn start_write(&self, lba: u32, count: u32, high_capacity: bool) -> Result<(), ErrorCode> {
-        let addr = if high_capacity { lba } else { lba * BLOCK_SIZE as u32 };
+        let addr = if high_capacity {
+            lba
+        } else {
+            lba * BLOCK_SIZE as u32
+        };
         self.set_write_timeout();
         self.regs.blkr.set(((BLOCK_SIZE as u32) << 16) | count);
         let cmd = if count == 1 {
@@ -999,7 +1043,8 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         self.state.set(State::Ready);
         let count = self.read_count.get();
         if let Some(buf) = self.buffer.take() {
-            self.write_client.map(move |c| c.write_done(buf, count, result));
+            self.write_client
+                .map(move |c| c.write_done(buf, count, result));
         }
     }
 
@@ -1032,15 +1077,23 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         }
         if rc.data != RawData::None {
             cmdr |= TRCMD_START
-                | if rc.data == RawData::Read { TRDIR_READ } else { 0 }
-                | if rc.block_count > 1 || rc.auto_stop { TRTYP_MULTIPLE } else { TRTYP_SINGLE };
+                | if rc.data == RawData::Read {
+                    TRDIR_READ
+                } else {
+                    0
+                }
+                | if rc.block_count > 1 || rc.auto_stop {
+                    TRTYP_MULTIPLE
+                } else {
+                    TRTYP_SINGLE
+                };
             self.regs
                 .blkr
                 .set(((rc.block_len as u32) << 16) | rc.block_count as u32);
             if rc.data == RawData::Write {
                 self.set_write_timeout();
             }
-            if rc.block_len % 4 != 0 {
+            if !rc.block_len.is_multiple_of(4) {
                 self.regs.mr.set(self.regs.mr.get() | MR_FBYTE);
             }
         }
@@ -1079,7 +1132,8 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
         } else if resp == Resp::R1b {
             let sr = self.regs.sr.get();
             if sr & SR_NOTBUSY == 0 || sr & SR_DTIP != 0 {
-                self.raw_busy_polls.set(RAW_BUSY_TIMEOUT_MS / RAW_BUSY_POLL_MS);
+                self.raw_busy_polls
+                    .set(RAW_BUSY_TIMEOUT_MS / RAW_BUSY_POLL_MS);
                 return Ok(false);
             }
         }
@@ -1089,9 +1143,14 @@ impl<'a, A: Alarm<'a>> Hsmci<'a, A> {
     }
 
     /// The data phase of a raw command, then CMD12 if asked for.
-    fn raw_data(&self, rc: &RawCommand, buf: &mut [u8], result: &mut RawResult) -> Result<(), ErrorCode> {
+    fn raw_data(
+        &self,
+        rc: &RawCommand,
+        buf: &mut [u8],
+        result: &mut RawResult,
+    ) -> Result<(), ErrorCode> {
         let data = &mut buf[..rc.block_len as usize * rc.block_count as usize];
-        let bytewise = rc.block_len % 4 != 0;
+        let bytewise = !rc.block_len.is_multiple_of(4);
         match (rc.data, bytewise) {
             (RawData::Read, false) => self.read_data(data)?,
             (RawData::Read, true) => self.read_data_bytes(data)?,
@@ -1173,7 +1232,7 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
     }
 
     fn is_card_present(&self) -> bool {
-        self.card_detect.map_or(true, |pin| !pin.read())
+        self.card_detect.is_none_or(|pin| !pin.read())
     }
 
     fn initialize(&self) -> Result<(), ErrorCode> {
@@ -1217,7 +1276,11 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
 
     fn set_bus(&self, width: u8, clock_hz: u32) -> Result<u32, ErrorCode> {
         if self.state.get() != State::Ready {
-            return Err(if self.state.get() == State::Off { ErrorCode::OFF } else { ErrorCode::BUSY });
+            return Err(if self.state.get() == State::Off {
+                ErrorCode::OFF
+            } else {
+                ErrorCode::BUSY
+            });
         }
         let mut info = self.info.get().ok_or(ErrorCode::OFF)?;
         if (width != 1 && width != 4) || clock_hz < INIT_CLOCK_HZ || clock_hz > DATA_CLOCK_HZ {
@@ -1232,7 +1295,11 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
                 self.set_clock(info.clock_hz);
                 return Err(e);
             }
-            self.regs.sdcr.set(if width == 4 { SDCR_BUS_4BIT } else { SDCR_BUS_1BIT });
+            self.regs.sdcr.set(if width == 4 {
+                SDCR_BUS_4BIT
+            } else {
+                SDCR_BUS_1BIT
+            });
             info.bus_width = width;
         }
         info.clock_hz = self.set_clock(clock_hz);
@@ -1247,7 +1314,11 @@ impl<'a, A: Alarm<'a>> Sdmmc<'a> for Hsmci<'a, A> {
         count: u32,
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
         if self.state.get() != State::Ready {
-            let e = if self.state.get() == State::Off { ErrorCode::OFF } else { ErrorCode::BUSY };
+            let e = if self.state.get() == State::Off {
+                ErrorCode::OFF
+            } else {
+                ErrorCode::BUSY
+            };
             return Err((e, buffer));
         }
         let info = match self.info.get() {
@@ -1286,7 +1357,11 @@ impl<'a, A: Alarm<'a>> SdmmcWrite<'a> for Hsmci<'a, A> {
         count: u32,
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
         if self.state.get() != State::Ready {
-            let e = if self.state.get() == State::Off { ErrorCode::OFF } else { ErrorCode::BUSY };
+            let e = if self.state.get() == State::Off {
+                ErrorCode::OFF
+            } else {
+                ErrorCode::BUSY
+            };
             return Err((e, buffer));
         }
         let info = match self.info.get() {
@@ -1350,7 +1425,11 @@ impl<'a, A: Alarm<'a>> SdmmcWrite<'a> for Hsmci<'a, A> {
         if !self.hw_up.get() {
             self.hw_init();
         }
-        self.regs.sdcr.set(if width == 4 { SDCR_BUS_4BIT } else { SDCR_BUS_1BIT });
+        self.regs.sdcr.set(if width == 4 {
+            SDCR_BUS_4BIT
+        } else {
+            SDCR_BUS_1BIT
+        });
         let hz = self.set_clock(clock_hz);
         if let Some(mut info) = self.info.get() {
             info.bus_width = width;

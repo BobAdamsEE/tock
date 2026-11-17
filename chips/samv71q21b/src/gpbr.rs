@@ -1,6 +1,10 @@
-use kernel::utilities::registers::interfaces::{Readable, Writeable};
-use kernel::utilities::registers::{register_bitfields, register_structs, ReadWrite};
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 use kernel::utilities::StaticRef;
+use kernel::utilities::registers::interfaces::{Readable, Writeable};
+use kernel::utilities::registers::{ReadWrite, register_bitfields, register_structs};
 
 const GPBR_BASE: StaticRef<GpbrRegisters> =
     unsafe { StaticRef::new(0x400E1890 as *const GpbrRegisters) };

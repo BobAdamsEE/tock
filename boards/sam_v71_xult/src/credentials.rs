@@ -1,3 +1,7 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 //! Credential policy: sign what needs privilege, leave everything else alone.
 //!
 //! Tock splits two decisions that are easy to conflate:
@@ -20,12 +24,12 @@
 //! An unsigned application is `LocallyUnique` and therefore matches nothing.
 //! A mistake in the assigner denies privilege rather than granting it.
 
+use kernel::ErrorCode;
 use kernel::process::{Process, ProcessBinary, ShortId};
 use kernel::process_checker::{
     AppCredentialsPolicy, AppCredentialsPolicyClient, AppUniqueness, CheckResult, Compress,
 };
 use kernel::utilities::cells::OptionalCell;
-use kernel::ErrorCode;
 use tock_tbf::types::TbfFooterV2Credentials;
 
 /// Wraps a credential checker so that a missing credential is not fatal.
@@ -110,11 +114,7 @@ impl SignedAppIdAssigner {
             hash = hash.wrapping_mul(0x0100_0193);
         }
         // Zero is not a legal fixed ShortId.
-        if hash == 0 {
-            1
-        } else {
-            hash
-        }
+        if hash == 0 { 1 } else { hash }
     }
 }
 

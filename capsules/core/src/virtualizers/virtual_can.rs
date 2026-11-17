@@ -53,12 +53,12 @@
 
 use core::cell::Cell;
 
+use kernel::ErrorCode;
 use kernel::collections::list::{List, ListLink, ListNode};
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
 use kernel::hil::can;
 use kernel::hil::can::{Configure, Controller, Receive, Transmit};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::ErrorCode;
 
 /// Number of identifier subscriptions each [`CanDevice`] can hold.
 pub const MAX_SUBSCRIPTIONS: usize = 4;
@@ -371,7 +371,7 @@ impl<'a, C: can::Can + can::Filter> MuxCan<'a, C> {
     }
 }
 
-impl<'a, C: can::Can + can::Filter> DeferredCallClient for MuxCan<'a, C> {
+impl<C: can::Can + can::Filter> DeferredCallClient for MuxCan<'_, C> {
     fn register(&'static self) {
         self.deferred_call.register(self);
     }
@@ -399,9 +399,9 @@ impl<'a, C: can::Can + can::Filter> DeferredCallClient for MuxCan<'a, C> {
                 }
                 Pending::TxFail => {
                     if let Some(buffer) = device.tx_buffer.take() {
-                        device.transmit_client.map(|c| {
-                            c.transmit_complete(Err(can::Error::SetBySoftware), buffer)
-                        });
+                        device
+                            .transmit_client
+                            .map(|c| c.transmit_complete(Err(can::Error::SetBySoftware), buffer));
                     }
                     self.do_next_tx();
                 }
@@ -415,7 +415,7 @@ impl<'a, C: can::Can + can::Filter> DeferredCallClient for MuxCan<'a, C> {
 // Callbacks from the underlying peripheral
 // ---------------------------------------------------------------------------
 
-impl<'a, C: can::Can + can::Filter> can::ControllerClient for MuxCan<'a, C> {
+impl<C: can::Can + can::Filter> can::ControllerClient for MuxCan<'_, C> {
     fn state_changed(&self, state: can::State) {
         // Bus state is global; every client needs to know.
         for device in self.devices.iter() {
@@ -456,7 +456,7 @@ impl<'a, C: can::Can + can::Filter> can::ControllerClient for MuxCan<'a, C> {
     }
 }
 
-impl<'a, C: can::Can + can::Filter> can::TransmitClient<PACKET_SIZE> for MuxCan<'a, C> {
+impl<C: can::Can + can::Filter> can::TransmitClient<PACKET_SIZE> for MuxCan<'_, C> {
     fn transmit_complete(
         &self,
         status: Result<(), can::Error>,
@@ -478,7 +478,7 @@ impl<'a, C: can::Can + can::Filter> can::TransmitClient<PACKET_SIZE> for MuxCan<
     }
 }
 
-impl<'a, C: can::Can + can::Filter> can::ReceiveClient<PACKET_SIZE> for MuxCan<'a, C> {
+impl<C: can::Can + can::Filter> can::ReceiveClient<PACKET_SIZE> for MuxCan<'_, C> {
     fn message_received(
         &self,
         id: can::Id,
@@ -616,7 +616,7 @@ impl<'a, C: can::Can + can::Filter> ListNode<'a, CanDevice<'a, C>> for CanDevice
 /// Exposes the inherent subscription methods behind a trait object, so a
 /// capsule can keep a device's subscriptions in sync with its own clients
 /// without being generic over `CanDevice`.
-impl<'a, C: can::Can + can::Filter> Subscribe for CanDevice<'a, C> {
+impl<C: can::Can + can::Filter> Subscribe for CanDevice<'_, C> {
     fn subscribe(&self, id: can::Id, mask: u32) -> Result<(), ErrorCode> {
         CanDevice::subscribe(self, id, mask)
     }
@@ -641,7 +641,7 @@ impl<'a, C: can::Can + can::Filter> Subscribe for CanDevice<'a, C> {
 /// board setup. Once several processes can reach a CAN device, these must stop
 /// being reachable from userspace -- see the syscall rework in
 /// `can_reprogramming_design.md` section 10.5.
-impl<'a, C: can::Can + can::Filter> Configure for CanDevice<'a, C> {
+impl<C: can::Can + can::Filter> Configure for CanDevice<'_, C> {
     const MIN_BIT_TIMINGS: can::BitTiming = C::MIN_BIT_TIMINGS;
     const MAX_BIT_TIMINGS: can::BitTiming = C::MAX_BIT_TIMINGS;
     const SYNC_SEG: u8 = C::SYNC_SEG;
@@ -687,7 +687,7 @@ impl<'a, C: can::Can + can::Filter> Configure for CanDevice<'a, C> {
     }
 }
 
-impl<'a, C: can::Can + can::Filter> Controller for CanDevice<'a, C> {
+impl<C: can::Can + can::Filter> Controller for CanDevice<'_, C> {
     fn set_client(&self, client: Option<&'static dyn can::ControllerClient>) {
         match client {
             Some(c) => self.controller_client.set(c),
@@ -755,7 +755,7 @@ impl<'a, C: can::Can + can::Filter> Controller for CanDevice<'a, C> {
     }
 }
 
-impl<'a, C: can::Can + can::Filter> Transmit<PACKET_SIZE> for CanDevice<'a, C> {
+impl<C: can::Can + can::Filter> Transmit<PACKET_SIZE> for CanDevice<'_, C> {
     fn set_client(&self, client: Option<&'static dyn can::TransmitClient<PACKET_SIZE>>) {
         match client {
             Some(c) => self.transmit_client.set(c),
@@ -781,7 +781,7 @@ impl<'a, C: can::Can + can::Filter> Transmit<PACKET_SIZE> for CanDevice<'a, C> {
     }
 }
 
-impl<'a, C: can::Can + can::Filter> Receive<PACKET_SIZE> for CanDevice<'a, C> {
+impl<C: can::Can + can::Filter> Receive<PACKET_SIZE> for CanDevice<'_, C> {
     fn set_client(&self, client: Option<&'static dyn can::ReceiveClient<PACKET_SIZE>>) {
         match client {
             Some(c) => self.receive_client.set(c),

@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! USART1 driver for SAMV71Q21B.
 //!
@@ -10,12 +11,14 @@
 
 use core::cell::Cell;
 
+use kernel::ErrorCode;
 use kernel::hil;
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
-use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly};
-use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
+use kernel::utilities::registers::{
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
+};
 
 use crate::xdmac::{self, Xdmac};
 
@@ -123,7 +126,9 @@ const MCK_HZ: u32 = 150_000_000;
 const USART1_RHR_ADDR: u32 = 0x4002_8018;
 
 /// Multiplier applied to the interbyte_timeout value (u8) before
-/// programming into the 17-bit RTOR register. A larger RTOR value
+/// programming into the 17-bit RTOR register.
+///
+/// A larger RTOR value
 /// tolerates gaps introduced by the EDBG USB-CDC bridge between USB
 /// packets, preventing premature timeout during multi-packet commands
 /// like WritePage. With DMA receive the CPU is not in the data path,
@@ -162,7 +167,7 @@ pub struct Usart1<'a> {
     xdmac: OptionalCell<&'static Xdmac>,
 }
 
-impl<'a> Usart1<'a> {
+impl Usart1<'_> {
     pub const fn new() -> Self {
         Usart1 {
             regs: USART1_BASE,
@@ -198,30 +203,37 @@ impl<'a> Usart1<'a> {
             self.regs.idr.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
             self.regs.cr.write(Cr::RSTSTA::SET);
             self.regs.rtor.write(Rtor::TO.val(0));
-            self.xdmac.map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
+            self.xdmac
+                .map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
             let received = self.xdmac.map_or(0, |x| x.usart1_rx_transferred() as usize);
             if let Some(buf) = self.rx_buffer.take() {
                 self.rx_state.set(RxState::Idle);
                 self.rx_client.map(|c| {
-                    c.received_buffer(buf, received, Err(ErrorCode::FAIL), hil::uart::Error::OverrunError)
+                    c.received_buffer(
+                        buf,
+                        received,
+                        Err(ErrorCode::FAIL),
+                        hil::uart::Error::OverrunError,
+                    )
                 });
             }
             return;
         }
 
         // ---- DMA RX: timeout (normal completion) ----------------------
-        if csr.is_set(Csr::TIMEOUT) && imr.is_set(Ir::TIMEOUT)
+        if csr.is_set(Csr::TIMEOUT)
+            && imr.is_set(Ir::TIMEOUT)
             && self.rx_state.get() == RxState::ReceivingDma
         {
             self.regs.idr.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
             self.regs.rtor.write(Rtor::TO.val(0));
-            self.xdmac.map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
+            self.xdmac
+                .map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
             let received = self.xdmac.map_or(0, |x| x.usart1_rx_transferred() as usize);
             if let Some(buf) = self.rx_buffer.take() {
                 self.rx_state.set(RxState::Idle);
-                self.rx_client.map(|c| {
-                    c.received_buffer(buf, received, Ok(()), hil::uart::Error::None)
-                });
+                self.rx_client
+                    .map(|c| c.received_buffer(buf, received, Ok(()), hil::uart::Error::None));
             }
             return;
         }
@@ -230,7 +242,9 @@ impl<'a> Usart1<'a> {
         if (csr.is_set(Csr::OVRE) || csr.is_set(Csr::FRAME) || csr.is_set(Csr::PARE))
             && imr.is_set(Ir::RXRDY)
         {
-            self.regs.idr.write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+            self.regs.idr.write(
+                Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET,
+            );
             self.regs.cr.write(Cr::RSTSTA::SET);
             let error = if csr.is_set(Csr::OVRE) {
                 hil::uart::Error::OverrunError
@@ -278,9 +292,8 @@ impl<'a> Usart1<'a> {
                 self.regs.rtor.write(Rtor::TO.val(0));
                 if let Some(buf) = self.rx_buffer.take() {
                     self.rx_state.set(RxState::Idle);
-                    self.rx_client.map(|c| {
-                        c.received_buffer(buf, pos, Ok(()), hil::uart::Error::None)
-                    });
+                    self.rx_client
+                        .map(|c| c.received_buffer(buf, pos, Ok(()), hil::uart::Error::None));
                 }
             }
         }
@@ -335,22 +348,26 @@ impl<'a> Usart1<'a> {
 // HIL: Configure
 // ---------------------------------------------------------------------------
 
-impl<'a> hil::uart::Configure for Usart1<'a> {
+impl hil::uart::Configure for Usart1<'_> {
     fn configure(&self, params: hil::uart::Parameters) -> Result<(), ErrorCode> {
         // Reset and disable TX/RX.
-        self.regs.cr.write(Cr::RSTRX::SET + Cr::RSTTX::SET + Cr::RXDIS::SET + Cr::TXDIS::SET);
+        self.regs
+            .cr
+            .write(Cr::RSTRX::SET + Cr::RSTTX::SET + Cr::RXDIS::SET + Cr::TXDIS::SET);
 
         // Mode: normal USART, MCK clock, 8-bit, selected parity, stop bits, 16× oversampling.
         let par = match params.parity {
             hil::uart::Parity::None => Mr::PAR::None,
             hil::uart::Parity::Even => Mr::PAR::Even,
-            hil::uart::Parity::Odd  => Mr::PAR::Odd,
+            hil::uart::Parity::Odd => Mr::PAR::Odd,
         };
         let stop = match params.stop_bits {
             hil::uart::StopBits::One => Mr::NBSTOP::One,
             hil::uart::StopBits::Two => Mr::NBSTOP::Two,
         };
-        self.regs.mr.write(Mr::USCLKS::Mck + Mr::CHRL::Bits8 + par + stop + Mr::OVER::X16);
+        self.regs
+            .mr
+            .write(Mr::USCLKS::Mck + Mr::CHRL::Bits8 + par + stop + Mr::OVER::X16);
 
         // Baud rate generator: MCK / (16 × (CD + FP/8)), rounded to the
         // nearest eighth. The fractional part matters at high rates: 921600
@@ -363,7 +380,9 @@ impl<'a> hil::uart::Configure for Usart1<'a> {
             .write(Brgr::CD.val(eighths / 8) + Brgr::FP.val(eighths % 8));
 
         // Clear status flags and enable TX + RX.
-        self.regs.cr.write(Cr::RSTSTA::SET + Cr::RXEN::SET + Cr::TXEN::SET);
+        self.regs
+            .cr
+            .write(Cr::RSTSTA::SET + Cr::RXEN::SET + Cr::TXEN::SET);
 
         Ok(())
     }
@@ -441,7 +460,9 @@ impl<'a> hil::uart::Receive<'a> for Usart1<'a> {
         self.rx_pos.set(0);
         self.rx_state.set(RxState::Receiving);
         self.rx_buffer.replace(rx_buffer);
-        self.regs.ier.write(Ir::RXRDY::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+        self.regs
+            .ier
+            .write(Ir::RXRDY::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
         Ok(())
     }
 
@@ -455,23 +476,33 @@ impl<'a> hil::uart::Receive<'a> for Usart1<'a> {
             return Ok(());
         }
         if state == RxState::ReceivingDma {
-            self.xdmac.map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
+            self.xdmac
+                .map(|x| x.disable_channel(xdmac::USART1_RX_CHANNEL));
             self.regs.idr.write(Ir::TIMEOUT::SET + Ir::OVRE::SET);
             let received = self.xdmac.map_or(0, |x| x.usart1_rx_transferred() as usize);
             self.regs.rtor.write(Rtor::TO.val(0));
             self.rx_state.set(RxState::Idle);
             if let Some(buf) = self.rx_buffer.take() {
-                self.rx_client
-                    .map(|c| c.received_buffer(buf, received, Err(ErrorCode::CANCEL), hil::uart::Error::Aborted));
+                self.rx_client.map(|c| {
+                    c.received_buffer(
+                        buf,
+                        received,
+                        Err(ErrorCode::CANCEL),
+                        hil::uart::Error::Aborted,
+                    )
+                });
             }
         } else {
-            self.regs.idr.write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+            self.regs.idr.write(
+                Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET,
+            );
             self.regs.rtor.write(Rtor::TO.val(0));
             self.rx_state.set(RxState::Idle);
             if let Some(buf) = self.rx_buffer.take() {
                 let pos = self.rx_pos.get();
-                self.rx_client
-                    .map(|c| c.received_buffer(buf, pos, Err(ErrorCode::CANCEL), hil::uart::Error::Aborted));
+                self.rx_client.map(|c| {
+                    c.received_buffer(buf, pos, Err(ErrorCode::CANCEL), hil::uart::Error::Aborted)
+                });
             }
         }
         Err(ErrorCode::BUSY)
@@ -526,9 +557,9 @@ impl<'a> hil::uart::ReceiveAdvanced<'a> for Usart1<'a> {
             self.rx_buffer.replace(rx_buffer);
             self.regs.rtor.write(Rtor::TO.val(interbyte_timeout as u32));
             self.regs.cr.write(Cr::STTTO::SET);
-            self.regs
-                .ier
-                .write(Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET);
+            self.regs.ier.write(
+                Ir::RXRDY::SET + Ir::TIMEOUT::SET + Ir::OVRE::SET + Ir::FRAME::SET + Ir::PARE::SET,
+            );
         }
         Ok(())
     }

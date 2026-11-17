@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! TWIHS (Two-Wire Interface High Speed) I2C master driver for SAMV71Q21B.
 //!
@@ -22,10 +23,12 @@
 use core::cell::Cell;
 
 use kernel::hil;
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
-use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly};
-use kernel::utilities::StaticRef;
+use kernel::utilities::registers::{
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
+};
 
 // ---------------------------------------------------------------------------
 // Register layout — SAMV71 TWIHS (§43, Table 43-3)
@@ -171,7 +174,10 @@ const MCK_HZ: u32 = 150_000_000;
 enum State {
     Idle,
     /// Pure write: sending `len` bytes from the buffer.
-    Writing { len: usize, pos: usize },
+    Writing {
+        len: usize,
+        pos: usize,
+    },
     /// Write phase of a write-then-read: sending `write_len` bytes,
     /// then switching to read of `read_len` bytes.
     WriteReading {
@@ -180,7 +186,10 @@ enum State {
         read_len: usize,
     },
     /// Read phase (either standalone read or second half of write_read).
-    Reading { len: usize, pos: usize },
+    Reading {
+        len: usize,
+        pos: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +204,7 @@ pub struct Twihs<'a> {
     client: OptionalCell<&'a dyn hil::i2c::I2CHwMasterClient>,
 }
 
-impl<'a> Twihs<'a> {
+impl Twihs<'_> {
     pub const fn new_twihs0() -> Self {
         Self::new(TWIHS0_BASE)
     }
@@ -226,7 +235,9 @@ impl<'a> Twihs<'a> {
         // Write protection covers MMR, CWGR, and other config registers
         // (datasheet Table 43-2).  Keep it disabled so that later MMR
         // writes in write()/read()/write_read() are not silently dropped.
-        self.regs.wpmr.write(Wpmr::WPKEY.val(WP_KEY) + Wpmr::WPEN::CLEAR);
+        self.regs
+            .wpmr
+            .write(Wpmr::WPKEY.val(WP_KEY) + Wpmr::WPEN::CLEAR);
 
         let target = MCK_HZ / (2 * freq_hz);
         let mut ckdiv: u32 = 0;
@@ -249,9 +260,9 @@ impl<'a> Twihs<'a> {
     }
 
     fn enable_error_interrupts(&self) {
-        self.regs.ier.write(
-            Sr::NACK::SET + Sr::ARBLST::SET + Sr::OVRE::SET,
-        );
+        self.regs
+            .ier
+            .write(Sr::NACK::SET + Sr::ARBLST::SET + Sr::OVRE::SET);
     }
 
     fn reset(&self) {
@@ -344,16 +355,19 @@ impl<'a> Twihs<'a> {
                     } else {
                         // Write phase done — switch to read.
                         self.disable_all_interrupts();
-                        self.regs.mmr.modify(
-                            Mmr::DADR.val(self.addr.get() as u32) + Mmr::MREAD::SET,
-                        );
+                        self.regs
+                            .mmr
+                            .modify(Mmr::DADR.val(self.addr.get() as u32) + Mmr::MREAD::SET);
                         // Issue repeated START (and STOP if only 1 byte to read).
                         if read_len == 1 {
                             self.regs.cr.write(Cr::START::SET + Cr::STOP::SET);
                         } else {
                             self.regs.cr.write(Cr::START::SET);
                         }
-                        self.state.set(State::Reading { len: read_len, pos: 0 });
+                        self.state.set(State::Reading {
+                            len: read_len,
+                            pos: 0,
+                        });
                         self.regs.ier.write(Sr::RXRDY::SET);
                         self.enable_error_interrupts();
                     }
@@ -428,9 +442,9 @@ impl<'a> hil::i2c::I2CMaster<'a> for Twihs<'a> {
 
         self.addr.set(addr);
         // MMR: write direction, 7-bit address, no internal address.
-        self.regs.mmr.write(
-            Mmr::DADR.val(addr as u32) + Mmr::MREAD::CLEAR + Mmr::IADRSZ::None,
-        );
+        self.regs
+            .mmr
+            .write(Mmr::DADR.val(addr as u32) + Mmr::MREAD::CLEAR + Mmr::IADRSZ::None);
 
         // The first byte written to THR triggers the START automatically.
         let first = data[0];
@@ -459,9 +473,9 @@ impl<'a> hil::i2c::I2CMaster<'a> for Twihs<'a> {
         }
 
         self.addr.set(addr);
-        self.regs.mmr.write(
-            Mmr::DADR.val(addr as u32) + Mmr::MREAD::SET + Mmr::IADRSZ::None,
-        );
+        self.regs
+            .mmr
+            .write(Mmr::DADR.val(addr as u32) + Mmr::MREAD::SET + Mmr::IADRSZ::None);
 
         self.buffer.replace(buffer);
         self.state.set(State::Reading { len, pos: 0 });
@@ -513,13 +527,16 @@ impl<'a> hil::i2c::I2CMaster<'a> for Twihs<'a> {
                 iadr = (iadr << 8) | data[i] as u32;
             }
 
-            self.regs.mmr.write(
-                Mmr::DADR.val(addr as u32) + Mmr::MREAD::SET + iadrsz,
-            );
+            self.regs
+                .mmr
+                .write(Mmr::DADR.val(addr as u32) + Mmr::MREAD::SET + iadrsz);
             self.regs.iadr.write(Iadr::IADR.val(iadr));
 
             self.buffer.replace(data);
-            self.state.set(State::Reading { len: read_len, pos: 0 });
+            self.state.set(State::Reading {
+                len: read_len,
+                pos: 0,
+            });
 
             self.disable_all_interrupts();
             if read_len == 1 {
@@ -532,9 +549,9 @@ impl<'a> hil::i2c::I2CMaster<'a> for Twihs<'a> {
         } else {
             // For write phases longer than 3 bytes, send them manually
             // via THR, then transition to read in the interrupt handler.
-            self.regs.mmr.write(
-                Mmr::DADR.val(addr as u32) + Mmr::MREAD::CLEAR + Mmr::IADRSZ::None,
-            );
+            self.regs
+                .mmr
+                .write(Mmr::DADR.val(addr as u32) + Mmr::MREAD::CLEAR + Mmr::IADRSZ::None);
 
             let first = data[0];
             self.buffer.replace(data);

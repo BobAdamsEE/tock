@@ -1,3 +1,7 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 //! Tock kernel for the Chameleon board (PCA-0001-01).
 //!
 //! DRAFT, written before the first board exists: it builds, but nothing here
@@ -60,7 +64,10 @@ pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 /// The SD host, for the type of the userspace driver.
 type SdHost = samv71q21b::hsmci::Hsmci<
     'static,
-    capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<'static, samv71q21b::tc::Tc<'static>>,
+    capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<
+        'static,
+        samv71q21b::tc::Tc<'static>,
+    >,
 >;
 
 type ChipHw = Atsamv71q21b<Atsamv71q21bDefaultPeripherals>;
@@ -130,13 +137,27 @@ impl KernelResources<ChipHw> for Chameleon {
     type WatchDog = samv71q21b::wdt::Wdt;
     type ContextSwitchCallback = ();
 
-    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup { self }
-    fn syscall_filter(&self) -> &Self::SyscallFilter { &() }
-    fn process_fault(&self) -> &Self::ProcessFault { &() }
-    fn scheduler(&self) -> &Self::Scheduler { self.scheduler }
-    fn scheduler_timer(&self) -> &Self::SchedulerTimer { &self.systick }
-    fn watchdog(&self) -> &Self::WatchDog { self.watchdog }
-    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback { &() }
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        self.watchdog
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
+        &()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,26 +263,29 @@ pub unsafe fn main() {
     }
 
     // Pin mux: MCAN1 — PC12 = RX (Peripheral C), PC14 = TX (Peripheral C)
-    peripherals.pc.pin(12).select_peripheral(PeripheralFunction::C);
-    peripherals.pc.pin(14).select_peripheral(PeripheralFunction::C);
+    peripherals
+        .pc
+        .pin(12)
+        .select_peripheral(PeripheralFunction::C);
+    peripherals
+        .pc
+        .pin(14)
+        .select_peripheral(PeripheralFunction::C);
 
     // Process array.
     let processes = components::process_array::ProcessArrayComponent::new()
         .finalize(components::process_array_component_static!(NUM_PROCS_USIZE));
 
-    let board_kernel = static_init!(
-        kernel::Kernel,
-        kernel::Kernel::new(processes.as_slice())
-    );
+    let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(processes.as_slice()));
 
     let chip = static_init!(ChipHw, Atsamv71q21b::new(peripherals));
     CHIP = Some(chip);
 
     // NVIC: enable only the interrupts we handle.
-    cortexm7::nvic::Nvic::new(6).enable();  // EFC
+    cortexm7::nvic::Nvic::new(6).enable(); // EFC
     cortexm7::nvic::Nvic::new(23).enable(); // TC0_CH0
     cortexm7::nvic::Nvic::new(mcan::MCAN1_PID).enable(); // MCAN1 INT0
-    cortexm7::nvic::Nvic::new(38).enable();              // MCAN1 INT1
+    cortexm7::nvic::Nvic::new(38).enable(); // MCAN1 INT1
 
     // -----------------------------------------------------------------------
     // Alarm (TC0 @ 32 kHz SLCK)
@@ -316,11 +340,17 @@ pub unsafe fn main() {
     // PA29 = card detect, active low, R93 to +3V3. Powering the card here,
     // long before an app can initialize it, leaves the LDO time to settle.
     pmc::PMC.enable_peripheral_clock(samv71q21b::hsmci::HSMCI_PID);
-    peripherals.pa.pin(25).select_peripheral(PeripheralFunction::D);
+    peripherals
+        .pa
+        .pin(25)
+        .select_peripheral(PeripheralFunction::D);
     peripherals.pa.pin(25).disable_pull_up();
     for pin in [26, 27, 28, 30, 31] {
         peripherals.pa.pin(pin).disable_pull_up();
-        peripherals.pa.pin(pin).select_peripheral(PeripheralFunction::C);
+        peripherals
+            .pa
+            .pin(pin)
+            .select_peripheral(PeripheralFunction::C);
     }
     let sd_detect = peripherals.pa.pin(29);
     sd_detect.enable();
@@ -340,7 +370,11 @@ pub unsafe fn main() {
     hil::time::Alarm::set_alarm_client(sd_alarm, hsmci);
     kernel::deferred_call::DeferredCallClient::register(hsmci);
 
-    let sd_buf = static_init!([u8; 64 * hil::sdmmc::BLOCK_SIZE], [0; 64 * hil::sdmmc::BLOCK_SIZE]);
+    #[allow(clippy::large_stack_arrays)] // static_init! places it in a static
+    let sd_buf = static_init!(
+        [u8; 64 * hil::sdmmc::BLOCK_SIZE],
+        [0; 64 * hil::sdmmc::BLOCK_SIZE]
+    );
     let sdmmc = static_init!(
         capsules_extra::sdmmc::SdmmcDriver<'static, SdHost>,
         capsules_extra::sdmmc::SdmmcDriver::new(
@@ -411,9 +445,8 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     // Scheduler
     // -----------------------------------------------------------------------
-    let scheduler =
-        components::sched::round_robin::RoundRobinComponent::new(processes)
-            .finalize(components::round_robin_component_static!(NUM_PROCS_USIZE));
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(processes)
+        .finalize(components::round_robin_component_static!(NUM_PROCS_USIZE));
 
     let watchdog = static_init!(samv71q21b::wdt::Wdt, samv71q21b::wdt::Wdt::new());
 
@@ -453,13 +486,10 @@ pub unsafe fn main() {
     let verifying_key = static_init!(
         [u8; 64],
         [
-            0xb9, 0xe2, 0x2e, 0xf0, 0x5f, 0xea, 0xfc, 0xaa,
-            0x4b, 0xa5, 0x9b, 0x66, 0xae, 0x93, 0xab, 0x64,
-            0x19, 0x63, 0x98, 0x8b, 0x47, 0xe8, 0xb9, 0x66,
-            0xad, 0x2d, 0x8c, 0xf3, 0x64, 0xd0, 0x12, 0x61,
-            0x39, 0x0f, 0x32, 0x83, 0xaa, 0x01, 0x58, 0xf3,
-            0xd5, 0x77, 0x8b, 0xe0, 0x8a, 0x62, 0x96, 0xe2,
-            0x74, 0xe3, 0x12, 0x6b, 0x8c, 0x15, 0x53, 0x9a,
+            0xb9, 0xe2, 0x2e, 0xf0, 0x5f, 0xea, 0xfc, 0xaa, 0x4b, 0xa5, 0x9b, 0x66, 0xae, 0x93,
+            0xab, 0x64, 0x19, 0x63, 0x98, 0x8b, 0x47, 0xe8, 0xb9, 0x66, 0xad, 0x2d, 0x8c, 0xf3,
+            0x64, 0xd0, 0x12, 0x61, 0x39, 0x0f, 0x32, 0x83, 0xaa, 0x01, 0x58, 0xf3, 0xd5, 0x77,
+            0x8b, 0xe0, 0x8a, 0x62, 0x96, 0xe2, 0x74, 0xe3, 0x12, 0x6b, 0x8c, 0x15, 0x53, 0x9a,
             0x3a, 0x2a, 0x08, 0x38, 0x43, 0x96, 0x5c, 0x53,
         ]
     );
@@ -594,11 +624,14 @@ pub unsafe fn panic_fmt(pi: &core::panic::PanicInfo) -> ! {
         let _ = write!(rtt, "\r\n\r\n!!! KERNEL PANIC !!!\r\n{}\r\n", pi);
 
         // [CCR, CFSR, HFSR, MMFAR, BFAR], saved when a process faulted.
-        let scb = addr_of!(cortexm::syscall::SCB_REGISTERS) as *const [u32; 5];
+        let scb = addr_of!(cortexm::syscall::SCB_REGISTERS).cast::<[u32; 5]>();
         let _ = write!(
             rtt,
             "CFSR=0x{:08X} HFSR=0x{:08X} MMFAR=0x{:08X} BFAR=0x{:08X}\r\n",
-            (*scb)[1], (*scb)[2], (*scb)[3], (*scb)[4],
+            (*scb)[1],
+            (*scb)[2],
+            (*scb)[3],
+            (*scb)[4],
         );
         let _ = write!(rtt, "!!! HALTED !!!\r\n");
     }

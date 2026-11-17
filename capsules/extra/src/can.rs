@@ -67,7 +67,7 @@ use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::utilities::streaming_process_slice::StreamingProcessSlice;
 
 use capsules_core::driver;
-use capsules_core::virtualizers::virtual_can::{covering_filter, Subscribe, Subscription};
+use capsules_core::virtualizers::virtual_can::{Subscribe, Subscription, covering_filter};
 
 pub const DRIVER_NUM: usize = driver::NUM::Can as usize;
 

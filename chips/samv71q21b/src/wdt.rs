@@ -1,3 +1,7 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 //! Watchdog timer.
 //!
 //! # WDT_MR is write-once
@@ -32,9 +36,11 @@
 //! reset, a core that is legitimately waiting does not.
 
 use kernel::platform::watchdog;
-use kernel::utilities::registers::interfaces::Writeable;
-use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly};
 use kernel::utilities::StaticRef;
+use kernel::utilities::registers::interfaces::Writeable;
+use kernel::utilities::registers::{
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
+};
 
 const WDT_BASE: StaticRef<WdtRegisters> =
     unsafe { StaticRef::new(0x400E1850 as *const WdtRegisters) };
@@ -104,13 +110,12 @@ impl Wdt {
     pub fn start(&self, period_ms: u32) {
         let ticks = (period_ms.min(MAX_PERIOD_MS) * TICKS_PER_SECOND / 1000).max(1);
 
+        // WDD = WDV: no forbidden window, so a restart is always allowed. A
+        // window would catch code petting the watchdog *too often*, which is
+        // a real fault class, but it also turns a harmless extra pet into a
+        // reset -- not a trade worth making on a development board.
         self.registers.mr.write(
             MR::WDV.val(ticks)
-                // No forbidden window: a restart is always allowed. A window
-                // would catch code petting the watchdog *too often*, which is
-                // a real fault class, but it also turns a harmless extra pet
-                // into a reset -- not a trade worth making on a development
-                // board.
                 + MR::WDD.val(ticks)
                 + MR::WDRSTEN::SET
                 + MR::WDDBGHLT::SET
@@ -129,9 +134,7 @@ impl Wdt {
     /// not returned to the kernel's main loop -- which is the case that needs
     /// it, since a multi-page flash erase never yields.
     pub fn pet(&self) {
-        self.registers
-            .cr
-            .write(CR::KEY.val(KEY) + CR::WDRSTT::SET);
+        self.registers.cr.write(CR::KEY.val(KEY) + CR::WDRSTT::SET);
     }
 }
 

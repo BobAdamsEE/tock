@@ -67,16 +67,18 @@ impl Atsamv71q21bDefaultPeripherals {
 impl InterruptService for Atsamv71q21bDefaultPeripherals {
     fn service_interrupt(&self, interrupt: u32) -> bool {
         match interrupt {
-            nvic::EFC      => self.efc.handle_interrupt(),
-            nvic::USART1   => self.usart1.handle_interrupt(),
-            nvic::XDMAC    => { self.xdmac.handle_interrupt(); }
-            nvic::TC0_CH0  => self.tc0.handle_interrupt(),
-            nvic::PIOA     => self.pa.handle_interrupt(),
-            nvic::PIOB     => self.pb.handle_interrupt(),
-            nvic::PIOC     => self.pc.handle_interrupt(),
-            nvic::PIOD     => self.pd.handle_interrupt(),
-            nvic::PIOE     => self.pe.handle_interrupt(),
-            nvic::TWIHS0     => self.twihs0.handle_interrupt(),
+            nvic::EFC => self.efc.handle_interrupt(),
+            nvic::USART1 => self.usart1.handle_interrupt(),
+            nvic::XDMAC => {
+                self.xdmac.handle_interrupt();
+            }
+            nvic::TC0_CH0 => self.tc0.handle_interrupt(),
+            nvic::PIOA => self.pa.handle_interrupt(),
+            nvic::PIOB => self.pb.handle_interrupt(),
+            nvic::PIOC => self.pc.handle_interrupt(),
+            nvic::PIOD => self.pd.handle_interrupt(),
+            nvic::PIOE => self.pe.handle_interrupt(),
+            nvic::TWIHS0 => self.twihs0.handle_interrupt(),
             nvic::MCAN1_INT0 => self.mcan1.handle_interrupt(),
             nvic::MCAN1_INT1 => self.mcan1.handle_interrupt(),
             // Correctable ECC error — hardware has already corrected the data,

@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! XDMAC (Extended DMA Controller) driver for SAMV71Q21B.
 //!
@@ -110,15 +111,17 @@ impl Xdmac {
             core::ptr::write_volatile(channel_reg(channel, CUBC), count);
             core::ptr::write_volatile(channel_reg(channel, CBC), 0);
 
-            // CC: PER_TRAN | PER2MEM | BYTE | SIF=IF1 | DIF=IF0 |
-            //     SAM=FIXED | DAM=INCR | PERID
-            let cc = (1 << CC_TYPE_POS)        // PER_TRAN
-                | (0 << CC_DSYNC_POS)          // PER2MEM
-                | (0 << CC_DWIDTH_POS)         // BYTE
-                | (1 << CC_SIF_POS)            // IF1 (peripheral bus)
-                | (0 << CC_DIF_POS)            // IF0 (system bus / SRAM)
-                | (0 << CC_SAM_POS)            // FIXED (source = RHR)
-                | (1 << CC_DAM_POS)            // INCREMENTED (destination)
+            // CC, field by field: TYPE = PER_TRAN, DSYNC = PER2MEM,
+            // DWIDTH = BYTE, SIF = IF1 (peripheral bus), DIF = IF0 (system
+            // bus / SRAM), SAM = FIXED (source = RHR), DAM = INCREMENTED
+            // (destination), PERID.
+            let cc = (1 << CC_TYPE_POS)
+                | (0 << CC_DSYNC_POS)
+                | (0 << CC_DWIDTH_POS)
+                | (1 << CC_SIF_POS)
+                | (0 << CC_DIF_POS)
+                | (0 << CC_SAM_POS)
+                | (1 << CC_DAM_POS)
                 | (perid << CC_PERID_POS);
             core::ptr::write_volatile(channel_reg(channel, CC), cc);
         }
@@ -162,8 +165,7 @@ impl Xdmac {
         let mut completed: u32 = 0;
 
         if gis & (1 << USART1_RX_CHANNEL) != 0 {
-            let cis =
-                unsafe { core::ptr::read_volatile(channel_reg(USART1_RX_CHANNEL, CIS)) };
+            let cis = unsafe { core::ptr::read_volatile(channel_reg(USART1_RX_CHANNEL, CIS)) };
             if cis & BIS != 0 {
                 completed |= 1 << USART1_RX_CHANNEL;
             }

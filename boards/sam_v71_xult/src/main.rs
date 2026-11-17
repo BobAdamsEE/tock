@@ -1,3 +1,7 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
+
 //! Tock kernel for the SAMV71 Xplained Ultra evaluation board.
 //!
 //! - ATSAMV71Q21B, Cortex-M7, 300 MHz / 150 MHz MCK
@@ -39,16 +43,23 @@ use samv71q21b::twihs;
 // ---------------------------------------------------------------------------
 
 /// Package name of the one application permitted to reboot the board into the
-/// bootloader. Trusting the name is sound here because it is only consulted
+/// bootloader.
+///
+/// Trusting the name is sound here because it is only consulted
 /// for an application whose signature was accepted, and the signature covers
 /// the header the name lives in.
 const PRIVILEGED_APP_NAME: &str = "uds";
 
-/// Console baud rate. 115200 normally; the `fast_console` feature selects
-/// 921600 for bulk transfers over the EDBG virtual COM port, such as pulling
+/// Console baud rate.
+///
+/// 115200 normally; the `fast_console` feature selects 921600 for bulk transfers over the EDBG virtual COM port, such as pulling
 /// sectors off a failing SD card with the sd_dump application. The bootloader
 /// and the panic handler keep their own 115200.
-const CONSOLE_BAUD: u32 = if cfg!(feature = "fast_console") { 921_600 } else { 115_200 };
+const CONSOLE_BAUD: u32 = if cfg!(feature = "fast_console") {
+    921_600
+} else {
+    115_200
+};
 
 const NUM_PROCS: u8 = 4;
 const NUM_PROCS_USIZE: usize = NUM_PROCS as usize;
@@ -61,7 +72,10 @@ pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 /// The SD host, for the type of the userspace driver.
 type SdHost = samv71q21b::hsmci::Hsmci<
     'static,
-    capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<'static, samv71q21b::tc::Tc<'static>>,
+    capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<
+        'static,
+        samv71q21b::tc::Tc<'static>,
+    >,
 >;
 
 static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> = None;
@@ -137,13 +151,27 @@ impl KernelResources<Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> for SamV71Xul
     type WatchDog = samv71q21b::wdt::Wdt;
     type ContextSwitchCallback = ();
 
-    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup { self }
-    fn syscall_filter(&self) -> &Self::SyscallFilter { &() }
-    fn process_fault(&self) -> &Self::ProcessFault { &() }
-    fn scheduler(&self) -> &Self::Scheduler { self.scheduler }
-    fn scheduler_timer(&self) -> &Self::SchedulerTimer { &self.systick }
-    fn watchdog(&self) -> &Self::WatchDog { self.watchdog }
-    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback { &() }
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        self.watchdog
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
+        &()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,10 +197,22 @@ impl capsules_extra::at24mac402::At24Mac402Client for EepromDebugClient {
         if status.is_ok() {
             debug!(
                 "AT24MAC402 serial: {:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}",
-                serial[0], serial[1], serial[2], serial[3],
-                serial[4], serial[5], serial[6], serial[7],
-                serial[8], serial[9], serial[10], serial[11],
-                serial[12], serial[13], serial[14], serial[15],
+                serial[0],
+                serial[1],
+                serial[2],
+                serial[3],
+                serial[4],
+                serial[5],
+                serial[6],
+                serial[7],
+                serial[8],
+                serial[9],
+                serial[10],
+                serial[11],
+                serial[12],
+                serial[13],
+                serial[14],
+                serial[15],
             );
         } else {
             debug!("AT24MAC402 serial read failed");
@@ -234,12 +274,24 @@ pub unsafe fn main() {
             core::ptr::read_volatile(ccfg_sysio) | (1u32 << 4),
         );
     }
-    peripherals.pa.pin(21).select_peripheral(PeripheralFunction::A);
-    peripherals.pb.pin(4).select_peripheral(PeripheralFunction::D);
+    peripherals
+        .pa
+        .pin(21)
+        .select_peripheral(PeripheralFunction::A);
+    peripherals
+        .pb
+        .pin(4)
+        .select_peripheral(PeripheralFunction::D);
 
     // Pin mux: TWIHS0 (I2C0) — PA3 = TWD0/SDA, PA4 = TWCK0/SCL.
-    peripherals.pa.pin(3).select_peripheral(PeripheralFunction::A);
-    peripherals.pa.pin(4).select_peripheral(PeripheralFunction::A);
+    peripherals
+        .pa
+        .pin(3)
+        .select_peripheral(PeripheralFunction::A);
+    peripherals
+        .pa
+        .pin(4)
+        .select_peripheral(PeripheralFunction::A);
 
     // MCAN1: enable peripheral clock + PCK5 as CAN core clock.
     // SAMV71 MCAN uses PCK5 (not GCLK). PCK5 = PLLA / (14+1) = 20 MHz.
@@ -257,17 +309,20 @@ pub unsafe fn main() {
     }
 
     // Pin mux: MCAN1 — PC12 = RX (Peripheral C), PC14 = TX (Peripheral C)
-    peripherals.pc.pin(12).select_peripheral(PeripheralFunction::C);
-    peripherals.pc.pin(14).select_peripheral(PeripheralFunction::C);
+    peripherals
+        .pc
+        .pin(12)
+        .select_peripheral(PeripheralFunction::C);
+    peripherals
+        .pc
+        .pin(14)
+        .select_peripheral(PeripheralFunction::C);
 
     // Process array.
     let processes = components::process_array::ProcessArrayComponent::new()
         .finalize(components::process_array_component_static!(NUM_PROCS_USIZE));
 
-    let board_kernel = static_init!(
-        kernel::Kernel,
-        kernel::Kernel::new(processes.as_slice())
-    );
+    let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(processes.as_slice()));
 
     let chip = static_init!(
         Atsamv71q21b<Atsamv71q21bDefaultPeripherals>,
@@ -277,14 +332,14 @@ pub unsafe fn main() {
 
     // NVIC: enable only the interrupts we handle.
     cortexm7::nvic::Nvic::new(14).enable(); // USART1
-    cortexm7::nvic::Nvic::new(6).enable();  // EFC
+    cortexm7::nvic::Nvic::new(6).enable(); // EFC
     cortexm7::nvic::Nvic::new(23).enable(); // TC0_CH0
     cortexm7::nvic::Nvic::new(10).enable(); // PIOA
     cortexm7::nvic::Nvic::new(11).enable(); // PIOB
     cortexm7::nvic::Nvic::new(12).enable(); // PIOC
     cortexm7::nvic::Nvic::new(twihs::TWIHS0_PID).enable(); // TWIHS0
-    cortexm7::nvic::Nvic::new(mcan::MCAN1_PID).enable();  // MCAN1 INT0
-    cortexm7::nvic::Nvic::new(38).enable();                // MCAN1 INT1
+    cortexm7::nvic::Nvic::new(mcan::MCAN1_PID).enable(); // MCAN1 INT0
+    cortexm7::nvic::Nvic::new(38).enable(); // MCAN1 INT1
 
     // -----------------------------------------------------------------------
     // Alarm (TC0 @ 32 kHz SLCK)
@@ -322,8 +377,11 @@ pub unsafe fn main() {
     // console writes in small chunks, and the tee holds each one for RTT's
     // 1 ms completion alarm -- invisible at 115200, but at 921600 it capped
     // throughput at about a third of the line rate.
-    let console_uart: &'static dyn hil::uart::Uart<'static> =
-        if cfg!(feature = "fast_console") { &peripherals.usart1 } else { console_tee };
+    let console_uart: &'static dyn hil::uart::Uart<'static> = if cfg!(feature = "fast_console") {
+        &peripherals.usart1
+    } else {
+        console_tee
+    };
     let uart_mux = components::console::UartMuxComponent::new(console_uart, CONSOLE_BAUD)
         .finalize(components::uart_mux_component_static!());
 
@@ -369,10 +427,16 @@ pub unsafe fn main() {
     // pull-ups; the internal ones are enabled in case the holder has none.
     pmc::PMC.enable_peripheral_clock(16); // PIOD, for card detect
     pmc::PMC.enable_peripheral_clock(samv71q21b::hsmci::HSMCI_PID);
-    peripherals.pa.pin(25).select_peripheral(PeripheralFunction::D);
+    peripherals
+        .pa
+        .pin(25)
+        .select_peripheral(PeripheralFunction::D);
     for pin in [26, 27, 28, 30, 31] {
         peripherals.pa.pin(pin).enable_pull_up();
-        peripherals.pa.pin(pin).select_peripheral(PeripheralFunction::C);
+        peripherals
+            .pa
+            .pin(pin)
+            .select_peripheral(PeripheralFunction::C);
     }
     let sd_detect = peripherals.pd.pin(18);
     sd_detect.enable();
@@ -394,7 +458,11 @@ pub unsafe fn main() {
     // Up to 64 blocks (32 KiB) per read. Each read command costs the card
     // milliseconds of access latency, so few large reads beat many small
     // ones; the driver drains them in short chunks, so size costs no latency.
-    let sd_buf = static_init!([u8; 64 * hil::sdmmc::BLOCK_SIZE], [0; 64 * hil::sdmmc::BLOCK_SIZE]);
+    #[allow(clippy::large_stack_arrays)] // static_init! places it in a static
+    let sd_buf = static_init!(
+        [u8; 64 * hil::sdmmc::BLOCK_SIZE],
+        [0; 64 * hil::sdmmc::BLOCK_SIZE]
+    );
     let sdmmc = static_init!(
         capsules_extra::sdmmc::SdmmcDriver<'static, SdHost>,
         capsules_extra::sdmmc::SdmmcDriver::new(
@@ -415,8 +483,9 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     // I2C bus (TWIHS0) + AT24MAC402 EEPROM
     // -----------------------------------------------------------------------
-    let mux_i2c = components::i2c::I2CMuxComponent::new(&peripherals.twihs0, None)
-        .finalize(components::i2c_mux_component_static!(samv71q21b::twihs::Twihs));
+    let mux_i2c = components::i2c::I2CMuxComponent::new(&peripherals.twihs0, None).finalize(
+        components::i2c_mux_component_static!(samv71q21b::twihs::Twihs),
+    );
 
     // User EEPROM (256 bytes, R/W) at 0x57.
     let eeprom_i2c = components::i2c::I2CComponent::new(mux_i2c, 0x57)
@@ -523,9 +592,8 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     // Scheduler
     // -----------------------------------------------------------------------
-    let scheduler =
-        components::sched::round_robin::RoundRobinComponent::new(processes)
-            .finalize(components::round_robin_component_static!(NUM_PROCS_USIZE));
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(processes)
+        .finalize(components::round_robin_component_static!(NUM_PROCS_USIZE));
 
     let watchdog = static_init!(samv71q21b::wdt::Wdt, samv71q21b::wdt::Wdt::new());
 
@@ -572,13 +640,10 @@ pub unsafe fn main() {
     let verifying_key = static_init!(
         [u8; 64],
         [
-            0xb9, 0xe2, 0x2e, 0xf0, 0x5f, 0xea, 0xfc, 0xaa,
-            0x4b, 0xa5, 0x9b, 0x66, 0xae, 0x93, 0xab, 0x64,
-            0x19, 0x63, 0x98, 0x8b, 0x47, 0xe8, 0xb9, 0x66,
-            0xad, 0x2d, 0x8c, 0xf3, 0x64, 0xd0, 0x12, 0x61,
-            0x39, 0x0f, 0x32, 0x83, 0xaa, 0x01, 0x58, 0xf3,
-            0xd5, 0x77, 0x8b, 0xe0, 0x8a, 0x62, 0x96, 0xe2,
-            0x74, 0xe3, 0x12, 0x6b, 0x8c, 0x15, 0x53, 0x9a,
+            0xb9, 0xe2, 0x2e, 0xf0, 0x5f, 0xea, 0xfc, 0xaa, 0x4b, 0xa5, 0x9b, 0x66, 0xae, 0x93,
+            0xab, 0x64, 0x19, 0x63, 0x98, 0x8b, 0x47, 0xe8, 0xb9, 0x66, 0xad, 0x2d, 0x8c, 0xf3,
+            0x64, 0xd0, 0x12, 0x61, 0x39, 0x0f, 0x32, 0x83, 0xaa, 0x01, 0x58, 0xf3, 0xd5, 0x77,
+            0x8b, 0xe0, 0x8a, 0x62, 0x96, 0xe2, 0x74, 0xe3, 0x12, 0x6b, 0x8c, 0x15, 0x53, 0x9a,
             0x3a, 0x2a, 0x08, 0x38, 0x43, 0x96, 0x5c, 0x53,
         ]
     );
@@ -717,11 +782,11 @@ pub unsafe fn panic_fmt(pi: &core::panic::PanicInfo) -> ! {
     //   US_CR  +0x00  US_MR  +0x04  US_BRGR +0x20
     //   US_CSR +0x14  US_THR +0x1C
     const US_BASE: u32 = 0x4002_8000;
-    const US_CR: *mut u32   = (US_BASE + 0x00) as *mut u32;
-    const US_MR: *mut u32   = (US_BASE + 0x04) as *mut u32;
+    const US_CR: *mut u32 = (US_BASE + 0x00) as *mut u32;
+    const US_MR: *mut u32 = (US_BASE + 0x04) as *mut u32;
     const US_BRGR: *mut u32 = (US_BASE + 0x20) as *mut u32;
     const US_CSR: *const u32 = (US_BASE + 0x14) as *const u32;
-    const US_THR: *mut u32   = (US_BASE + 0x1C) as *mut u32;
+    const US_THR: *mut u32 = (US_BASE + 0x1C) as *mut u32;
 
     // Disable TX/RX, then reconfigure: 8-N-1 at MCK (150 MHz) / 16 / 81 ≈ 115 740 bps.
     // US_MR: USCLKS=0 (MCK/16), CHRL=3 (8 bit), PAR=4 (none), NBSTOP=0 (1 stop).
@@ -752,26 +817,45 @@ pub unsafe fn panic_fmt(pi: &core::panic::PanicInfo) -> ! {
     // Print fault registers saved by hard_fault_handler when a process faulted.
     // SCB_REGISTERS = [CCR, CFSR, HFSR, MMFAR, BFAR] saved at fault time.
     // Only meaningful after "Process X had a fault"; harmless (all zeros) otherwise.
-    let scb = core::ptr::addr_of!(cortexm::syscall::SCB_REGISTERS) as *const [u32; 5];
-    let ccr   = unsafe { (*scb)[0] };
-    let cfsr  = unsafe { (*scb)[1] };
-    let hfsr  = unsafe { (*scb)[2] };
+    let scb = core::ptr::addr_of!(cortexm::syscall::SCB_REGISTERS).cast::<[u32; 5]>();
+    let ccr = unsafe { (*scb)[0] };
+    let cfsr = unsafe { (*scb)[1] };
+    let hfsr = unsafe { (*scb)[2] };
     let mmfar = unsafe { (*scb)[3] };
-    let bfar  = unsafe { (*scb)[4] };
+    let bfar = unsafe { (*scb)[4] };
     if cfsr != 0 || hfsr != 0 {
-        let _ = write!(uart,
+        let _ = write!(
+            uart,
             "CCR=0x{:08X} (UNALIGN_TRP={} DC={} IC={})\r\n\
              CFSR=0x{:08X} HFSR=0x{:08X} MMFAR=0x{:08X} BFAR=0x{:08X}\r\n\
              MemManage: IACCVIOL={} DACCVIOL={} MUNSTKERR={} MSTKERR={} MMFARVALID={}\r\n\
              BusFault:  IBUSERR={} PRECISERR={} UNSTKERR={} STKERR={} BFARVALID={}\r\n\
              UsageFault:UNDEFINSTR={} INVSTATE={} INVPC={} NOCP={} UNALIGNED={} DIVBYZERO={}\r\n\
              HardFault: FORCED={}\r\n",
-            ccr, (ccr >> 3) & 1, (ccr >> 16) & 1, (ccr >> 17) & 1,
-            cfsr, hfsr, mmfar, bfar,
-            (cfsr >> 0) & 1, (cfsr >> 1) & 1, (cfsr >> 3) & 1, (cfsr >> 4) & 1, (cfsr >> 7) & 1,
-            (cfsr >> 8) & 1, (cfsr >> 9) & 1, (cfsr >> 11) & 1, (cfsr >> 12) & 1, (cfsr >> 15) & 1,
-            (cfsr >> 16) & 1, (cfsr >> 17) & 1, (cfsr >> 18) & 1, (cfsr >> 19) & 1,
-            (cfsr >> 24) & 1, (cfsr >> 25) & 1,
+            ccr,
+            (ccr >> 3) & 1,
+            (ccr >> 16) & 1,
+            (ccr >> 17) & 1,
+            cfsr,
+            hfsr,
+            mmfar,
+            bfar,
+            (cfsr >> 0) & 1,
+            (cfsr >> 1) & 1,
+            (cfsr >> 3) & 1,
+            (cfsr >> 4) & 1,
+            (cfsr >> 7) & 1,
+            (cfsr >> 8) & 1,
+            (cfsr >> 9) & 1,
+            (cfsr >> 11) & 1,
+            (cfsr >> 12) & 1,
+            (cfsr >> 15) & 1,
+            (cfsr >> 16) & 1,
+            (cfsr >> 17) & 1,
+            (cfsr >> 18) & 1,
+            (cfsr >> 19) & 1,
+            (cfsr >> 24) & 1,
+            (cfsr >> 25) & 1,
             (hfsr >> 30) & 1,
         );
     }
@@ -780,27 +864,45 @@ pub unsafe fn panic_fmt(pi: &core::panic::PanicInfo) -> ! {
     // After a process fault the hard_fault_handler returns to the kernel on MSP;
     // PSP is left pointing at the stacked frame: [r0,r1,r2,r3,r12,lr,PC,xPSR].
     // Frame[6] (PSP+24) is the instruction address that caused the fault.
-    let psp: u32;
-    unsafe { core::arch::asm!("mrs {}, psp", out(reg) psp) };
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    let psp: u32 = {
+        let psp: u32;
+        unsafe { core::arch::asm!("mrs {}, psp", out(reg) psp) };
+        psp
+    };
+    // Host builds (CI's clippy and tests) have no PSP.
+    #[cfg(not(all(target_arch = "arm", target_os = "none")))]
+    let psp: u32 = 0;
     if psp != 0 && psp & 3 == 0 {
         let frame = psp as *const u32;
-        let stk_r0   = unsafe { frame.add(0).read_volatile() };
-        let stk_r1   = unsafe { frame.add(1).read_volatile() };
-        let stk_r2   = unsafe { frame.add(2).read_volatile() };
-        let stk_r3   = unsafe { frame.add(3).read_volatile() };
-        let stk_r12  = unsafe { frame.add(4).read_volatile() };
-        let stk_lr   = unsafe { frame.add(5).read_volatile() };
-        let stk_pc   = unsafe { frame.add(6).read_volatile() };
+        let stk_r0 = unsafe { frame.add(0).read_volatile() };
+        let stk_r1 = unsafe { frame.add(1).read_volatile() };
+        let stk_r2 = unsafe { frame.add(2).read_volatile() };
+        let stk_r3 = unsafe { frame.add(3).read_volatile() };
+        let stk_r12 = unsafe { frame.add(4).read_volatile() };
+        let stk_lr = unsafe { frame.add(5).read_volatile() };
+        let stk_pc = unsafe { frame.add(6).read_volatile() };
         let stk_xpsr = unsafe { frame.add(7).read_volatile() };
-        let xpsr_t   = (stk_xpsr >> 24) & 1;   // Thumb bit: must be 1
-        let xpsr_exc = stk_xpsr & 0x1FF;        // exception number: 0 = Thread mode
-        let xpsr_stk = (stk_xpsr >> 9) & 1;    // STKALIGN: 1 = pad word present
-        let _ = write!(uart,
+        let xpsr_t = (stk_xpsr >> 24) & 1; // Thumb bit: must be 1
+        let xpsr_exc = stk_xpsr & 0x1FF; // exception number: 0 = Thread mode
+        let xpsr_stk = (stk_xpsr >> 9) & 1; // STKALIGN: 1 = pad word present
+        let _ = write!(
+            uart,
             "PSP=0x{:08X} stk_PC=0x{:08X} stk_LR=0x{:08X} stk_xPSR=0x{:08X}\r\n\
              stk_r0=0x{:08X} stk_r1=0x{:08X} stk_r2=0x{:08X} stk_r3=0x{:08X} stk_r12=0x{:08X}\r\n\
              xPSR: T={} EXC={} STKALIGN={}\r\n",
-            psp, stk_pc, stk_lr, stk_xpsr, stk_r0, stk_r1, stk_r2, stk_r3, stk_r12,
-            xpsr_t, xpsr_exc, xpsr_stk,
+            psp,
+            stk_pc,
+            stk_lr,
+            stk_xpsr,
+            stk_r0,
+            stk_r1,
+            stk_r2,
+            stk_r3,
+            stk_r12,
+            xpsr_t,
+            xpsr_exc,
+            xpsr_stk,
         );
         // Dump stack memory from PSP-32 to PSP+64 (24 words) to find the real frame.
         // If PSP is wrong, a valid frame [r0,r1,r2,r3,r12,lr,PC,xPSR] should be

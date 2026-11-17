@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0 or the MIT License.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2026.
 
 //! Embedded Flash Controller (EFC/EEFC) driver for SAMV71Q21B.
 //!
@@ -24,12 +25,14 @@
 //!    returns FCMDE on this silicon. EPA (Erase Pages) + WP (Write
 //!    Page) issued separately work correctly.
 
+use kernel::ErrorCode;
 use kernel::hil::flash;
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::registers::interfaces::Writeable;
-use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite, WriteOnly};
-use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
+use kernel::utilities::registers::{
+    ReadOnly, ReadWrite, WriteOnly, register_bitfields, register_structs,
+};
 
 // ---------------------------------------------------------------------------
 // Register layout
@@ -97,6 +100,7 @@ const CMD_EPA: u32 = 0x07;
 const CMD_CLB: u32 = 0x09;
 
 /// EPA erase granularity: 16 pages (8 KB) per block.
+///
 /// FARG[1:0]=2 selects 16-page erase.  Using 32-page (FARG=3)
 /// caused tockloader's post-install clear_bytes to erase app data
 /// for small apps like c_hello (16 pages = 8 KB) because the
@@ -364,8 +368,7 @@ impl flash::Flash for Efc {
             return Err((ErrorCode::INVAL, buf));
         }
         let page_addr = FLASH_BASE + page_number * PAGE_SIZE;
-        let flash_slice =
-            unsafe { core::slice::from_raw_parts(page_addr as *const u8, PAGE_SIZE) };
+        let flash_slice = unsafe { core::slice::from_raw_parts(page_addr as *const u8, PAGE_SIZE) };
         buf.0.copy_from_slice(flash_slice);
         self.client.map(|c| c.read_complete(buf, Ok(())));
         Ok(())

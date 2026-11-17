@@ -1,3 +1,7 @@
+/* Licensed under the Apache License, Version 2.0 or the MIT License. */
+/* SPDX-License-Identifier: Apache-2.0 OR MIT                         */
+/* Copyright Tock Contributors 2026.                                  */
+
 /* SAMV71Q21B memory layout with tock-bootloader.
  *
  * Bootloader: 0x00000000–0x0000FFFF (64 KB)   physical 0x00400000–0x0040FFFF
