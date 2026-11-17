@@ -105,10 +105,11 @@ pub enum ErrorStage {
     Stuck = 5,
 }
 
-/// Diagnostics for the most recent failed operation, so that "the read
-/// failed" can be told apart from "the card is not answering" or "the data
-/// lines are bad". Raw values, to be decoded against the controller's status
-/// register and the SD R1 card-status bits.
+/// Diagnostics for the most recent failed operation.
+///
+/// They tell "the read failed" apart from "the card is not answering" or
+/// "the data lines are bad". Raw values, to be decoded against the
+/// controller's status register and the SD R1 card-status bits.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ErrorInfo {
     /// Command index that failed (e.g. 17, 18, 13).

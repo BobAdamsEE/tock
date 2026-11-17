@@ -178,7 +178,7 @@ impl Efc {
     fn call_iap(cmd: u32, arg: u32) -> u32 {
         let fcr = (FKEY << 24) | ((arg & 0xFFFF) << 8) | (cmd & 0xFF);
         let iap_ptr = unsafe { core::ptr::read_volatile(IAP_ENTRY_ADDR as *const u32) };
-        let iap: extern "C" fn(u32, u32) -> u32 = unsafe { core::mem::transmute(iap_ptr) };
+        let iap: extern "C" fn(u32, u32) -> u32 = unsafe { core::mem::transmute(iap_ptr as usize) };
         iap(0, fcr)
     }
 
@@ -214,7 +214,7 @@ impl Efc {
 
         // IAP function pointer (ROM NMI vector).
         let iap_ptr = unsafe { core::ptr::read_volatile(IAP_ENTRY_ADDR as *const u32) };
-        let iap: extern "C" fn(u32, u32) -> u32 = unsafe { core::mem::transmute(iap_ptr) };
+        let iap: extern "C" fn(u32, u32) -> u32 = unsafe { core::mem::transmute(iap_ptr as usize) };
 
         unsafe {
             // --- 1. Disable and invalidate caches ---
