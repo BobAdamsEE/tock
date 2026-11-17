@@ -3,9 +3,11 @@
 
 //! Userspace access to a native-mode SD card host (`hil::sdmmc::Sdmmc`).
 //!
-//! Read-only, like the HIL beneath it. Unlike the SPI `sdcard` capsule, this
-//! one exposes the card's identification registers (CID, CSD, SCR, OCR), and
-//! reads several blocks per request.
+//! Read-only unless the board calls `enable_writes`, which hands it the
+//! host's separate `SdmmcWrite` interface; until then commands 9-11 fail with
+//! `NOSUPPORT`. Unlike the SPI `sdcard` capsule, this one exposes the card's
+//! identification registers (CID, CSD, SCR, OCR), and reads several blocks
+//! per request.
 //!
 //! One process at a time owns the card: the first to issue a command keeps it
 //! until it exits.
@@ -23,12 +25,43 @@
 //! | 6 | `which`         | failure diagnostics: 0 last failure, 1 SD Status read at init. Returns `cmd \| stage << 8 \| card_state << 16`, controller SR, R1 |
 //! | 7 | `width`, `hz`   | set bus width (1/4) and clock; returns the clock set |
 //! | 8 | `ms`            | data timeout, 1-1000 ms (default 100, the SD specification's) |
+//! | 9 | `lba`, `count`  | write `count` blocks from RO allow 0; upcall kind 2 |
+//! | 10 |                | raw command described in RW allow 2; upcall kind 3 |
+//! | 11 | `width`, `hz`  | set the host's bus width and clock only, not the card's; returns the clock set |
+//!
+//! Commands 9-11 need `enable_writes`.
 //!
 //! ### Upcall 0: `(kind, status, value)`
 //!
 //! `status` is 0 on success, otherwise an `ErrorCode` value.
 //! * kind 0, initialize: `value` = capacity in 512-byte blocks.
 //! * kind 1, read: `value` = bytes copied into the application's buffer.
+//! * kind 2, write: `value` = bytes written.
+//! * kind 3, raw command: `value` = data bytes moved. The response is in RW
+//!   allow 2 even when `status` reports a failure.
+//!
+//! ### Raw command (RW allow 2, little-endian, at least 40 bytes)
+//!
+//! Filled in by the application:
+//!
+//! | Offset | Size | Field |
+//! |---|---|---|
+//! | 0  | 4 | argument |
+//! | 4  | 1 | command index, 0-63 |
+//! | 5  | 1 | response: 0 none, 1 R1/R6/R7, 2 R1b, 3 R2, 4 R3/R4 (no CRC) |
+//! | 6  | 1 | data: 0 none, 1 read into RW allow 0, 2 write from RO allow 0 |
+//! | 7  | 1 | flags: bit0 multiple-block transfer ended by CMD12 (CMD18/CMD25), bit1 send the 74 initialization clocks instead of a command |
+//! | 8  | 2 | block length, bytes (1-2048) |
+//! | 10 | 2 | block count |
+//!
+//! Filled in by the kernel when the command completes:
+//!
+//! | Offset | Size | Field |
+//! |---|---|---|
+//! | 12 | 16 | response words: 48-bit responses in the first (bits 39:8), R2 as bits 127:0, most significant word first |
+//! | 28 | 4  | host controller status register |
+//! | 32 | 4  | CMD12's response, if flag bit0 sent one |
+//! | 36 | 4  | data bytes moved |
 //!
 //! ### `CardInfo` layout (RW allow 1, little-endian integers)
 //!
@@ -49,11 +82,15 @@
 //! The first 56 bytes are the original layout; an application that allows a
 //! 56-byte buffer still gets exactly that.
 
+use core::cell::Cell;
 use core::cmp;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
-use kernel::hil::sdmmc::{CardInfo, Sdmmc, SdmmcClient, BLOCK_SIZE};
-use kernel::processbuffer::WriteableProcessBuffer;
+use kernel::hil::sdmmc::{
+    CardInfo, RawCommand, RawData, RawResponse, RawResult, Sdmmc, SdmmcClient, SdmmcWrite,
+    SdmmcWriteClient, BLOCK_SIZE,
+};
+use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::{ErrorCode, ProcessId};
@@ -64,40 +101,189 @@ pub const DRIVER_NUM: usize = driver::NUM::Sdmmc as usize;
 mod rw_allow {
     pub const READ: usize = 0;
     pub const INFO: usize = 1;
-    pub const COUNT: u8 = 2;
+    pub const RAW: usize = 2;
+    pub const COUNT: u8 = 3;
+}
+
+mod ro_allow {
+    pub const WRITE: usize = 0;
+    pub const COUNT: u8 = 1;
 }
 
 /// Serialized size of `CardInfo`.
 pub const CARD_INFO_LEN: usize = 184;
 
+/// Size of the raw command descriptor and result.
+pub const RAW_LEN: usize = 40;
+
 const KIND_INIT: usize = 0;
 const KIND_READ: usize = 1;
+const KIND_WRITE: usize = 2;
+const KIND_RAW: usize = 3;
+
+type Grants = Grant<
+    App,
+    UpcallCount<1>,
+    AllowRoCount<{ ro_allow::COUNT }>,
+    AllowRwCount<{ rw_allow::COUNT }>,
+>;
 
 #[derive(Default)]
 pub struct App;
 
 pub struct SdmmcDriver<'a, S: Sdmmc<'a>> {
     host: &'a S,
+    /// The host's write interface, if the board enabled writes.
+    writer: OptionalCell<&'a dyn SdmmcWrite<'a>>,
+    /// The raw command outstanding reads data, to be copied out.
+    raw_read: Cell<bool>,
     kernel_buf: TakeCell<'static, [u8]>,
     max_blocks: usize,
-    grants: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<{ rw_allow::COUNT }>>,
+    grants: Grants,
     owner: OptionalCell<ProcessId>,
 }
 
 impl<'a, S: Sdmmc<'a>> SdmmcDriver<'a, S> {
     /// `kernel_buf` bounds a single read; its length should be a multiple of
     /// `BLOCK_SIZE`.
-    pub fn new(
-        host: &'a S,
-        kernel_buf: &'static mut [u8],
-        grants: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<{ rw_allow::COUNT }>>,
-    ) -> Self {
+    pub fn new(host: &'a S, kernel_buf: &'static mut [u8], grants: Grants) -> Self {
         SdmmcDriver {
             host,
+            writer: OptionalCell::empty(),
+            raw_read: Cell::new(false),
             max_blocks: kernel_buf.len() / BLOCK_SIZE,
             kernel_buf: TakeCell::new(kernel_buf),
             grants,
             owner: OptionalCell::empty(),
+        }
+    }
+
+    /// Let applications write to the card and issue raw commands, through
+    /// `writer` -- normally the same host object as `host`. The board must
+    /// also make this capsule `writer`'s `SdmmcWriteClient`.
+    pub fn enable_writes(&self, writer: &'a dyn SdmmcWrite<'a>) {
+        self.writer.set(writer);
+    }
+
+    /// Start a write of `count` blocks from the owner's RO allow 0.
+    fn write(&self, writer: &'a dyn SdmmcWrite<'a>, lba: u32, count: usize, pid: ProcessId) -> CommandReturn {
+        if count == 0 || count > self.max_blocks {
+            return CommandReturn::failure(ErrorCode::INVAL);
+        }
+        let Some(buf) = self.kernel_buf.take() else {
+            return CommandReturn::failure(ErrorCode::BUSY);
+        };
+        let len = count * BLOCK_SIZE;
+        let copied = self
+            .grants
+            .enter(pid, |_, kd| {
+                kd.get_readonly_processbuffer(ro_allow::WRITE)
+                    .and_then(|b| {
+                        b.enter(|app_buf| {
+                            if app_buf.len() < len {
+                                return false;
+                            }
+                            app_buf[..len].copy_to_slice(&mut buf[..len]);
+                            true
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !copied {
+            self.kernel_buf.replace(buf);
+            return CommandReturn::failure(ErrorCode::SIZE);
+        }
+        match writer.write_blocks(buf, lba, count as u32) {
+            Ok(()) => CommandReturn::success(),
+            Err((e, buf)) => {
+                self.kernel_buf.replace(buf);
+                CommandReturn::failure(e)
+            }
+        }
+    }
+
+    /// Start the raw command described in the owner's RW allow 2.
+    fn raw(&self, writer: &'a dyn SdmmcWrite<'a>, pid: ProcessId) -> CommandReturn {
+        let mut desc = [0u8; 12];
+        let got = self
+            .grants
+            .enter(pid, |_, kd| {
+                kd.get_readwrite_processbuffer(rw_allow::RAW)
+                    .and_then(|b| {
+                        b.enter(|app_buf| {
+                            if app_buf.len() < RAW_LEN {
+                                return false;
+                            }
+                            app_buf[..12].copy_to_slice(&mut desc);
+                            true
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !got {
+            return CommandReturn::failure(ErrorCode::SIZE);
+        }
+        let command = RawCommand {
+            arg: u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]),
+            index: desc[4],
+            response: match desc[5] {
+                0 => RawResponse::None,
+                1 => RawResponse::R1,
+                2 => RawResponse::R1b,
+                3 => RawResponse::R2,
+                4 => RawResponse::R3,
+                _ => return CommandReturn::failure(ErrorCode::INVAL),
+            },
+            data: match desc[6] {
+                0 => RawData::None,
+                1 => RawData::Read,
+                2 => RawData::Write,
+                _ => return CommandReturn::failure(ErrorCode::INVAL),
+            },
+            auto_stop: desc[7] & 1 != 0,
+            init_clocks: desc[7] & 2 != 0,
+            block_len: u16::from_le_bytes([desc[8], desc[9]]),
+            block_count: u16::from_le_bytes([desc[10], desc[11]]),
+        };
+        let Some(buf) = self.kernel_buf.take() else {
+            return CommandReturn::failure(ErrorCode::BUSY);
+        };
+        if command.data == RawData::Write {
+            let len = command.block_len as usize * command.block_count as usize;
+            if len > buf.len() {
+                self.kernel_buf.replace(buf);
+                return CommandReturn::failure(ErrorCode::SIZE);
+            }
+            let copied = self
+                .grants
+                .enter(pid, |_, kd| {
+                    kd.get_readonly_processbuffer(ro_allow::WRITE)
+                        .and_then(|b| {
+                            b.enter(|app_buf| {
+                                if app_buf.len() < len {
+                                    return false;
+                                }
+                                app_buf[..len].copy_to_slice(&mut buf[..len]);
+                                true
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !copied {
+                self.kernel_buf.replace(buf);
+                return CommandReturn::failure(ErrorCode::SIZE);
+            }
+        }
+        self.raw_read.set(command.data == RawData::Read);
+        match writer.raw_command(command, buf) {
+            Ok(()) => CommandReturn::success(),
+            Err((e, buf)) => {
+                self.kernel_buf.replace(buf);
+                CommandReturn::failure(e)
+            }
         }
     }
 
@@ -159,6 +345,48 @@ impl<'a, S: Sdmmc<'a>> SdmmcClient for SdmmcDriver<'a, S> {
         }
         self.kernel_buf.replace(buffer);
         self.upcall(KIND_READ, result, copied);
+    }
+}
+
+impl<'a, S: Sdmmc<'a>> SdmmcWriteClient for SdmmcDriver<'a, S> {
+    fn write_done(&self, buffer: &'static mut [u8], count: u32, result: Result<(), ErrorCode>) {
+        self.kernel_buf.replace(buffer);
+        let written = if result.is_ok() { count as usize * BLOCK_SIZE } else { 0 };
+        self.upcall(KIND_WRITE, result, written);
+    }
+
+    fn raw_done(&self, buffer: &'static mut [u8], raw: RawResult, status: Result<(), ErrorCode>) {
+        let mut out = [0u8; RAW_LEN - 12];
+        for (i, w) in raw.resp.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out[16..20].copy_from_slice(&raw.sr.to_le_bytes());
+        out[20..24].copy_from_slice(&raw.stop_resp.to_le_bytes());
+        out[24..28].copy_from_slice(&raw.bytes.to_le_bytes());
+        let len = raw.bytes as usize;
+        self.owner.map(|pid| {
+            let _ = self.grants.enter(pid, |_, kd| {
+                let _ = kd.get_readwrite_processbuffer(rw_allow::RAW).and_then(|b| {
+                    b.mut_enter(|app_buf| {
+                        if app_buf.len() >= RAW_LEN {
+                            app_buf[12..RAW_LEN].copy_from_slice(&out);
+                        }
+                    })
+                });
+                // Read data (a write's data is not copied back: the buffer
+                // still holds what was sent).
+                let _ = kd.get_readwrite_processbuffer(rw_allow::READ).and_then(|b| {
+                    b.mut_enter(|app_buf| {
+                        let n = cmp::min(app_buf.len(), len);
+                        if self.raw_read.get() {
+                            app_buf[..n].copy_from_slice(&buffer[..n]);
+                        }
+                    })
+                });
+            });
+        });
+        self.kernel_buf.replace(buffer);
+        self.upcall(KIND_RAW, status, len);
     }
 }
 
@@ -249,6 +477,24 @@ impl<'a, S: Sdmmc<'a>> SyscallDriver for SdmmcDriver<'a, S> {
 
             // Data timeout in ms (arg1).
             8 => CommandReturn::from(self.host.set_data_timeout(arg1 as u32)),
+
+            9 => match self.writer.get() {
+                None => CommandReturn::failure(ErrorCode::NOSUPPORT),
+                Some(w) => self.write(w, arg1 as u32, arg2, pid),
+            },
+
+            10 => match self.writer.get() {
+                None => CommandReturn::failure(ErrorCode::NOSUPPORT),
+                Some(w) => self.raw(w, pid),
+            },
+
+            11 => match self.writer.get() {
+                None => CommandReturn::failure(ErrorCode::NOSUPPORT),
+                Some(w) => match w.set_host_bus(arg1 as u8, arg2 as u32) {
+                    Ok(hz) => CommandReturn::success_u32(hz),
+                    Err(e) => CommandReturn::failure(e),
+                },
+            },
 
             _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
         }

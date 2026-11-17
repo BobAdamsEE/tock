@@ -3,14 +3,16 @@
 
 //! Interface for a native-mode (SD bus, not SPI) SD memory card host.
 //!
-//! Deliberately **read-only**. The first user of this interface inspects cards
-//! for deleted-but-recoverable content, and the only way to guarantee that such
-//! a card is not altered is for no write path to exist at all. A write
-//! extension belongs in a separate trait, so a board has to opt in to it.
+//! `Sdmmc` is deliberately **read-only**. The first user of this interface
+//! inspects cards for deleted-but-recoverable content, and the only way to
+//! guarantee that such a card is not altered is for no write path to exist at
+//! all. Writing, and issuing arbitrary commands, live in the separate
+//! `SdmmcWrite` trait, so a board has to opt in to them.
 //!
 //! Sequence: `initialize()` -> `init_done()`, then any number of
-//! `read_blocks()` -> `read_done()`. Only one operation is outstanding at a
-//! time; starting another returns `BUSY`.
+//! `read_blocks()` -> `read_done()` (and, with `SdmmcWrite`, `write_blocks()`
+//! -> `write_done()` and `raw_command()` -> `raw_done()`). Only one operation
+//! is outstanding at a time; starting another returns `BUSY`.
 
 use crate::ErrorCode;
 
@@ -176,4 +178,119 @@ pub trait Sdmmc<'a> {
     /// slow-but-good block bad for speed on a card with many bad blocks,
     /// each of which costs a full timeout.
     fn set_data_timeout(&self, ms: u32) -> Result<(), ErrorCode>;
+}
+
+/// Response format of a raw command (SD Physical Layer Simplified
+/// Specification, section 4.9).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(u8)]
+pub enum RawResponse {
+    /// No response (CMD0, CMD4, CMD15).
+    #[default]
+    None = 0,
+    /// 48 bits with CRC: R1, R6, R7.
+    R1 = 1,
+    /// R1 followed by busy signalling on DAT0 (CMD7, CMD12, CMD28, CMD38...).
+    R1b = 2,
+    /// 136 bits: R2 (CID, CSD).
+    R2 = 3,
+    /// 48 bits without CRC: R3 (OCR), R4.
+    R3 = 4,
+}
+
+/// Data phase of a raw command.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(u8)]
+pub enum RawData {
+    #[default]
+    None = 0,
+    /// Card to host.
+    Read = 1,
+    /// Host to card.
+    Write = 2,
+}
+
+/// One command, sent exactly as described: nothing is checked against the
+/// card's state, no CMD55 prefix is added, and an error in the card's status
+/// is reported rather than acted on.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawCommand {
+    /// Command index, 0-63.
+    pub index: u8,
+    /// Command argument.
+    pub arg: u32,
+    pub response: RawResponse,
+    pub data: RawData,
+    /// Bytes per data block (1-2048). Ignored without a data phase.
+    pub block_len: u16,
+    /// Data blocks (1-65535). More than one makes it a multiple-block
+    /// transfer, which the card ends only on CMD12.
+    pub block_count: u16,
+    /// Treat the data phase as a multiple-block transfer, whatever
+    /// `block_count`, and send CMD12 once it is done -- what CMD18 and CMD25
+    /// need even for a single block.
+    pub auto_stop: bool,
+    /// Send the 74-clock initialization sequence instead of a command.
+    pub init_clocks: bool,
+}
+
+/// What came back from a raw command.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawResult {
+    /// The response. A 48-bit response is the card's 32-bit payload in
+    /// `resp[0]` (bits 39:8 of the response); an R2 response is bits
+    /// 127:0 in `resp[0..4]`, most significant word first.
+    pub resp: [u32; 4],
+    /// Host controller status register when the command finished or failed.
+    pub sr: u32,
+    /// CMD12's R1, if `auto_stop` sent it.
+    pub stop_resp: u32,
+    /// Data bytes moved.
+    pub bytes: u32,
+}
+
+/// Callbacks for `SdmmcWrite` operations.
+pub trait SdmmcWriteClient {
+    /// A write finished. `buffer` is returned either way.
+    fn write_done(&self, buffer: &'static mut [u8], count: u32, result: Result<(), ErrorCode>);
+
+    /// A raw command finished. For a read, the data is at the start of
+    /// `buffer`. The result is filled in as far as the command got even when
+    /// it failed: a response timeout leaves `resp` meaningless, but `sr`
+    /// says so.
+    fn raw_done(&self, buffer: &'static mut [u8], result: RawResult, status: Result<(), ErrorCode>);
+}
+
+/// Writes, and arbitrary commands, on an SD host that also implements
+/// `Sdmmc`. Kept apart from `Sdmmc` so that a board exposes a write path
+/// only by choice.
+pub trait SdmmcWrite<'a> {
+    fn set_write_client(&self, client: &'a dyn SdmmcWriteClient);
+
+    /// Write `count` blocks from `buffer` starting at block `lba`. Fails with
+    /// the same codes as `Sdmmc::read_blocks`. Success means the card
+    /// reported the data programmed, not just received.
+    fn write_blocks(
+        &self,
+        buffer: &'static mut [u8],
+        lba: u32,
+        count: u32,
+    ) -> Result<(), (ErrorCode, &'static mut [u8])>;
+
+    /// Issue one command, with an optional data phase through `buffer`
+    /// (`block_len * block_count` bytes; for a write, the data to send).
+    /// Allowed whether or not the card is initialized, so a card can be
+    /// brought up by hand. The host's record of the card (`card_info`) is not
+    /// updated: a command that changes the card's state or settings can leave
+    /// later `read_blocks` failing until the next `initialize`.
+    fn raw_command(
+        &self,
+        command: RawCommand,
+        buffer: &'static mut [u8],
+    ) -> Result<(), (ErrorCode, &'static mut [u8])>;
+
+    /// Set the host's bus width (1 or 4) and card clock without telling the
+    /// card, to follow a width or speed change made with raw commands.
+    /// Returns the clock actually set, which never exceeds `clock_hz`.
+    fn set_host_bus(&self, width: u8, clock_hz: u32) -> Result<u32, ErrorCode>;
 }

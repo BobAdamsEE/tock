@@ -21,11 +21,18 @@ a byte-identical image to `make`.
 
 .EXAMPLE
 .\build.ps1
+
+.EXAMPLE
+.\build.ps1 -Features sd_write
+Builds with the given Cargo features and writes sam_v71_xult-sd_write.bin
+instead, so a non-default image is never mistaken for the default one.
 #>
 [CmdletBinding()]
 param(
     # Skip the cargo build and only re-run objcopy on the existing ELF.
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    # Cargo features (see Cargo.toml). Each one is appended to the .bin name.
+    [string[]]$Features = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,14 +43,19 @@ $Target   = 'thumbv7em-none-eabihf'
 $BoardDir = $PSScriptRoot
 # Tock builds into the workspace-root target/, two levels up from the board.
 $Elf      = Join-Path $BoardDir "..\..\target\$Target\release\$Platform"
-$Bin      = Join-Path $BoardDir "$Platform.bin"
+$Suffix   = ($Features | ForEach-Object { "-$_" }) -join ''
+$Bin      = Join-Path $BoardDir "$Platform$Suffix.bin"
 
 Push-Location $BoardDir
 try {
     # ---- 1. Build -----------------------------------------------------------
     if (-not $NoBuild) {
         Write-Host "  CARGO     building $Platform (release)" -ForegroundColor Cyan
-        cargo build --release
+        if ($Features.Count -gt 0) {
+            cargo build --release --features ($Features -join ',')
+        } else {
+            cargo build --release
+        }
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
     }
 
@@ -75,7 +87,7 @@ try {
     # ---- 4. Report ----------------------------------------------------------
     $size = (Get-Item $Bin).Length
     $hash = (Get-FileHash $Bin -Algorithm SHA256).Hash
-    Write-Host "  BIN       $Platform.bin  $size bytes" -ForegroundColor Green
+    Write-Host "  BIN       $(Split-Path $Bin -Leaf)  $size bytes" -ForegroundColor Green
     Write-Host "  SHA256    $hash"
 
     if ($null -eq $prevHash) {
